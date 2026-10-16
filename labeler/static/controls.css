@@ -1,0 +1,33 @@
+[hidden]{display:none!important}
+select{width:100%;background:#10151c;color:#e7edf5;border:1px solid var(--line);border-radius:7px;padding:10px;font:inherit}
+select:focus{outline:2px solid #4caf95}
+.label-create{display:flex;gap:6px;align-items:center}
+.label-create input{min-width:0;flex:1}
+.label-create button{font-size:12px;white-space:nowrap}
+#label-list{display:flex;flex-direction:column;gap:6px;margin-top:12px}
+.label-option{display:flex;justify-content:space-between;align-items:center;gap:10px;text-align:left;overflow-wrap:anywhere}
+.label-option span:last-child{font-size:11px;color:var(--muted);white-space:nowrap}
+#label-count{float:right;color:var(--accent)}
+.displaybar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:12px;font-size:12px;color:var(--muted)}
+.displaybar button{padding:5px 10px;font-size:12px}
+.displaybar input#zoom{width:70px;padding:5px 7px;font-size:12px}
+.displaybar .hint{margin:0 0 0 4px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+#viewport{display:block;overflow:auto}
+#empty{height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center}
+#empty h1{margin:12px 0}#empty p{margin:6px 0}
+#canvas-wrap{display:flex;align-items:center;justify-content:center;width:max-content;height:max-content;min-width:100%;min-height:100%;padding:12px}
+canvas{display:block;flex:none;max-width:none;max-height:none;object-fit:fill}
+.label-entry{display:flex;gap:6px;align-items:stretch}
+.label-entry .label-option{flex:1;min-width:0}
+.label-color{width:30px;min-width:30px;padding:0;border:2px solid #8d9bac;border-radius:7px}
+.label-color:hover:not(:disabled){filter:brightness(1.2)}
+.color-choice{display:flex;gap:8px;align-items:center}
+.color-choice input[type=color]{width:38px;height:34px;padding:2px;flex:none;cursor:pointer}
+.palette{display:grid;grid-template-columns:repeat(4,22px);gap:5px}
+.palette button{width:22px;height:22px;padding:0;border:1px solid #718197;border-radius:4px}
+.palette button[aria-pressed=true]{outline:2px solid white;outline-offset:1px}
+#color-editor{margin-top:12px;padding:10px;background:#10151c;border:1px solid var(--line);border-radius:7px}
+#color-label{font-size:12px;overflow-wrap:anywhere}
+.opacitybar{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);padding-bottom:12px}
+.opacitybar label{margin:0}.opacitybar input{width:150px;accent-color:var(--accent)}.opacitybar output{width:36px}

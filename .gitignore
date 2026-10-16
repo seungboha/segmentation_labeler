@@ -1,0 +1,20 @@
+# Downloaded SAM 2 repository and model weights
+sam2/
+*.pt
+*.pth
+
+# Local datasets, annotations, and generated files
+labeler/projects/
+labeler/demo_frames/
+*.log
+server.pid
+
+# Python caches and environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local settings and secrets
+.env
+.env.*
