@@ -1,6 +1,8 @@
 const $ = id => document.getElementById(id);
 let project = null, frame = 0, image = null, savedMasks = [], points = [], draft = null, draftImage = null, draftMask = null;
 let colorLabel = null;
+const brush=new MaskBrush();
+let activeTool='sam', strokePointer=null, panPointer=null, spaceHeld=false;
 let busy = false, dirty = false, positive = true, editing = null;
 let displayMode = 'fit', displayZoom = 1;
 try { const preference=JSON.parse(localStorage.getItem('labeler-display')); if(preference?.mode==='custom'&&Number.isFinite(preference.zoom)){displayMode='custom';displayZoom=Math.max(.01,Math.min(8,preference.zoom));} } catch {}
@@ -15,9 +17,19 @@ function controls() {
   $('newlabel').disabled = busy || !project; $('zoom').disabled = busy || !image;
   for(const id of ['newcolor','editcolor','opacity'])$(id).disabled=busy || !project;
   for(const id of ['zoomout','zoomin','fit'])$(id).disabled=busy || !image;
-  $('save').disabled = busy || !draft; $('undo').disabled = busy || !points.length;
+  $('save').disabled = busy || !draft || strokePointer!==null;
+  $('save-mask').disabled=$('save').disabled;
+  $('undo').disabled = busy || !points.length || brush.modified || draft==='manual';
+  $('undo-stroke').disabled=busy || !brush.undoStack.length || strokePointer!==null;
+  $('redo-stroke').disabled=busy || !brush.redoStack.length || strokePointer!==null;
+  for(const id of ['brush-size'])$(id).disabled=busy || !image;
+  if(strokePointer!==null||panPointer!==null)for(const el of document.querySelectorAll('button,input,select'))el.disabled=true;
   $('prev').disabled = busy || !project || frame === 0;
   $('next').disabled = busy || !project || frame === project.frames.length-1;
+  // A stroke disables form inputs; visibility and folder selection must recover.
+  $('overlays').disabled=false;
+  $('toggle-masks').disabled=!image;
+  $('folderfiles').disabled=busy || strokePointer!==null || panPointer!==null;
 }
 async function task(fn) {
   if (busy) return;
@@ -54,13 +66,14 @@ function draw() {
     if(draftImage)ctx.drawImage(draftImage,0,0);
     ctx.restore();
   }
+  if(!$('overlays').checked)return;
   const radius=5*canvas.width/Math.max(canvas.getBoundingClientRect().width,1);
   for(const p of points){ctx.beginPath();ctx.arc(p.x,p.y,radius,0,2*Math.PI);ctx.fillStyle=p.label?'#68ffba':'#ff657f';ctx.fill();ctx.strokeStyle='#10151c';ctx.lineWidth=radius/3;ctx.stroke();}
 }
-function resetDraft() { points=[];draft=null;draftImage=null;draftMask=null;dirty=false;editing=null;$('object').value='';$('score').textContent='Click inside an object to start.';draw(); }
+function resetDraft() { brush.reset();points=[];draft=null;draftImage=null;draftMask=null;dirty=false;editing=null;$('object').value='';$('score').textContent='Click inside an object to start.';draw(); }
 function canDiscard() { return !dirty || confirm('Discard the unsaved object preview? Saved masks will stay on disk.'); }
 function labelColor(name){return project?.label_colors?.[name]||'#68ddbc';}
-function retintDraft(){draftImage=draftMask?tint(draftMask,labelColor($('class').value)):null;draw();}
+function retintDraft(){draftImage=brush.active?brush.colored(labelColor($('class').value)):null;draw();}
 function retintMasks(){for(const mask of savedMasks)mask.canvas=tint(mask.raw,labelColor(mask.label));retintDraft();}
 function renderPalette(id,inputId){
   $(id).replaceChildren(...palette.map(([name,color])=>{
@@ -102,9 +115,15 @@ function updateProject() {
     const swatch=document.createElement('span');swatch.className='swatch';swatch.style.background=labelColor(a.class_name);
     const title=document.createElement('span');title.textContent=`#${a.object_id} · ${a.class_name}`;
     const row=document.createElement('div');row.className='row';
-    const edit=document.createElement('button');edit.textContent='Refine';edit.onclick=()=>{if(busy||!canDiscard())return;task(async()=>{editing=a.object_id;$('object').value=a.object_id;$('class').value=a.class_name;updateLabels();points=a.points.map(p=>({...p}));dirty=true;await predict();});};
+    const edit=document.createElement('button');edit.textContent='Refine SAM';edit.onclick=()=>{if(busy||!canDiscard())return;if(a.manually_edited&&!confirm('Regenerating with SAM replaces the saved brush corrections in the preview. Continue?'))return;setTool('sam');task(async()=>{resetDraft();editing=a.object_id;$('object').value=a.object_id;$('class').value=a.class_name;updateLabels();points=a.points.map(p=>({...p}));dirty=true;await predict();});};
     const remove=document.createElement('button');remove.textContent='Delete';remove.onclick=()=>{if(busy||!confirm(`Delete saved object #${a.object_id} on this frame?`))return;task(async()=>{project=await api(`/api/mask/${frame}/${a.object_id}?project=${project.id}`,null,'DELETE');if(editing===a.object_id)resetDraft();await refreshMasks();updateProject();status('Object deleted.');});};
-    row.append(edit,remove);card.append(swatch,title,row);$('objects').append(card);
+    const paint=document.createElement('button');paint.textContent='Edit mask';paint.onclick=()=>{if(busy||!canDiscard())return;task(async()=>{
+      const raw=await loadImage(`/api/mask/${frame}/${a.object_id}?project=${project.id}&t=${Date.now()}`);
+      resetDraft();editing=a.object_id;$('object').value=a.object_id;$('class').value=a.class_name;points=a.points.map(p=>({...p}));
+      brush.load(raw);draftMask=brush.surface;draft='manual';updateLabels();setTool('brush');retintDraft();
+      status('Editing the saved mask. Paint or erase, then Save mask.');
+    });};
+    row.append(paint,edit,remove);card.append(swatch,title,row);$('objects').append(card);
   }
   updateLabels();
   $('opacity').value=Math.round((project.overlay_opacity??.45)*100);$('opacity-value').textContent=`${$('opacity').value}%`;
@@ -144,12 +163,11 @@ function setZoom(value) {
   status(`Display zoom ${value.toFixed(0)}%. SAM 2 and exported masks stay at ${image.width} × ${image.height}.`);
 }
 async function predict() {
-  draft=null;draftImage=null;draftMask=null;draw();
   if(!points.some(p=>p.label===1)){status('Add a positive point inside the object.');$('score').textContent='No positive points.';return;}
   status('Generating mask… First prediction loads the model.');
   const result=await api('/api/predict',{project:project.id,frame,points});
-  draftMask=await loadImage('data:image/png;base64,'+result.mask);
-  draft=result.draft;retintDraft();
+  const raw=await loadImage('data:image/png;base64,'+result.mask);
+  brush.load(raw);draftMask=brush.surface;draft=result.draft;retintDraft();
   $('score').textContent=`Model score ${(result.score*100).toFixed(1)}% · ${result.pixels.toLocaleString()} pixels`;
   status('Preview ready. Refine with more clicks, or save the object.');
 }
@@ -196,32 +214,106 @@ $('zoom').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();setZoom(Number($(
 $('zoomout').onclick=()=>setZoom(Math.max(1,Math.round(displayZoom*100/1.25)));
 $('zoomin').onclick=()=>setZoom(Math.min(800,Math.round(displayZoom*100*1.25)));
 $('fit').onclick=()=>{displayMode='fit';applyDisplay();$('viewport').scrollTo(0,0);localStorage.setItem('labeler-display',JSON.stringify({mode:'fit'}));status('Image fitted to the view. Original image and export size are unchanged.');};
+function setTool(tool){
+  activeTool=tool;
+  for(const name of ['sam','brush','erase','pan']){$('tool-'+name).classList.toggle('selected',name===tool);$('tool-'+name).setAttribute('aria-pressed',String(name===tool));}
+  canvas.style.cursor=tool==='pan'?'grab':tool==='sam'?'crosshair':'none';$('brush-cursor').hidden=true;
+}
+function brushPoint(event){const rect=canvas.getBoundingClientRect();return {x:Math.max(0,Math.min(canvas.width-0.001,(event.clientX-rect.left)*canvas.width/rect.width)),y:Math.max(0,Math.min(canvas.height-0.001,(event.clientY-rect.top)*canvas.height/rect.height))};}
+function cursorAt(event){
+  const cursor=$('brush-cursor');cursor.hidden=busy||spaceHeld||!['brush','erase'].includes(activeTool);
+  if(!cursor.hidden){const size=Number($('brush-size').value)*canvas.getBoundingClientRect().width/canvas.width;cursor.style.width=`${size}px`;cursor.style.height=`${size}px`;cursor.style.left=`${event.clientX}px`;cursor.style.top=`${event.clientY}px`;cursor.style.borderRadius='50%';cursor.classList.toggle('eraser',activeTool==='erase'||event.buttons===2);}
+}
+function showBrushChange(){draftMask=brush.surface;draft='manual';dirty=true;retintDraft();$('score').textContent='Manual correction · original-resolution mask';}
+for(const tool of ['sam','brush','erase','pan'])$('tool-'+tool).onclick=()=>setTool(tool);
+$('save-mask').onclick=()=>$('save').click();
+$('undo-stroke').onclick=()=>{if(brush.undo()){showBrushChange();controls();status('Stroke undone.');}};
+$('redo-stroke').onclick=()=>{if(brush.redo()){showBrushChange();controls();status('Stroke restored.');}};
+$('brush-size').onchange=()=>{$('brush-size').value=Math.max(1,Math.min(500,Math.round(Number($('brush-size').value)||25)));};
+canvas.style.touchAction='none';
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
 canvas.addEventListener('pointerdown',e=>{
-  if(busy||!image||!project||![0,2].includes(e.button))return;
-  e.preventDefault();const rect=canvas.getBoundingClientRect();
-  points.push({x:Math.min(image.width-1,Math.max(0,(e.clientX-rect.left)*image.width/rect.width)),y:Math.min(image.height-1,Math.max(0,(e.clientY-rect.top)*image.height/rect.height)),label:e.button===2?0:(positive?1:0)});
-  dirty=true;task(predict);
+  if(busy||!image||!project||strokePointer!==null||panPointer!==null)return;
+  if(spaceHeld||activeTool==='pan'||e.button===1){
+    e.preventDefault();const viewport=$('viewport');panPointer={id:e.pointerId,x:e.clientX,y:e.clientY,left:viewport.scrollLeft,top:viewport.scrollTop};canvas.setPointerCapture(e.pointerId);canvas.style.cursor='grabbing';$('brush-cursor').hidden=true;controls();return;
+  }
+  if(![0,2].includes(e.button))return;
+  e.preventDefault();const point=brushPoint(e);
+  if(activeTool==='sam'){
+    if((brush.modified||draft==='manual')&&!confirm('A new SAM prediction will replace your brush corrections. Continue?'))return;
+    points.push({...point,label:e.button===2?0:(positive?1:0)});dirty=true;task(predict);return;
+  }
+  if(!brush.active){brush.blank(canvas.width,canvas.height);draftMask=brush.surface;draft='manual';}
+  const size=Math.max(1,Math.min(500,Number($('brush-size').value)||25));
+  brush.begin(point,activeTool==='erase'||e.button===2,size);
+  strokePointer=e.pointerId;canvas.setPointerCapture(e.pointerId);retintDraft();cursorAt(e);controls();
 });
+canvas.addEventListener('pointermove',e=>{
+  if(panPointer?.id===e.pointerId){$('viewport').scrollLeft=panPointer.left-(e.clientX-panPointer.x);$('viewport').scrollTop=panPointer.top-(e.clientY-panPointer.y);return;}
+  cursorAt(e);
+  if(strokePointer!==e.pointerId)return;
+  for(const sample of (e.getCoalescedEvents?.().length?e.getCoalescedEvents():[e]))brush.stroke(brushPoint(sample));
+  retintDraft();
+});
+function finishPointer(e){
+  if(strokePointer===e.pointerId){const changed=brush.end();strokePointer=null;if(changed){showBrushChange();status('Mask corrected. Save mask to keep your changes.');}controls();}
+  if(panPointer?.id===e.pointerId){panPointer=null;setTool(activeTool);controls();}
+  if(canvas.hasPointerCapture(e.pointerId))canvas.releasePointerCapture(e.pointerId);
+}
+canvas.addEventListener('pointerup',finishPointer);canvas.addEventListener('pointercancel',finishPointer);canvas.addEventListener('lostpointercapture',finishPointer);
+canvas.addEventListener('pointerleave',()=>{$('brush-cursor').hidden=true;});
 $('undo').onclick=()=>{if(!points.length)return;points.pop();dirty=true;task(predict);};
-$('clear').onclick=()=>{points=[];draft=null;draftImage=null;draftMask=null;dirty=false;editing=null;draw();$('score').textContent='Click inside an object to start.';status('Clicks cleared.');controls();};
+$('clear').onclick=()=>{if(!canDiscard())return;resetDraft();status('Draft cleared. Saved masks are unchanged.');controls();};
 $('new').onclick=()=>{if(canDiscard()){resetDraft();controls();status('Ready for a new object.');}};
 $('save').onclick=()=>task(async()=>{
   const label=$('class').value.trim();if(!label)throw new Error('Enter a class name before saving.');
   const oid=$('object').value?Number($('object').value):null;
   if(oid!==null&&(!Number.isInteger(oid)||oid<1||oid>2147483647))throw new Error('Object ID must be a positive integer.');
   if((project.annotations[String(frame)]||[]).some(a=>a.object_id===oid)&&editing!==oid&&!confirm(`Replace object #${oid} on this frame?`))return;
-  project=await api('/api/save',{project:project.id,frame,draft,class_name:label,object_id:oid});
+  project=await api('/api/save',{project:project.id,frame,draft:draft==='manual'?null:draft,mask_png:(brush.modified||draft==='manual')?brush.png():null,points,class_name:label,object_id:oid});
   resetDraft();await refreshMasks();updateProject();status('Object saved to disk. Add another object or move to the next frame.');
 });
 function navigate(index){if(busy||!canDiscard()){ $('timeline').value=frame;return; }task(()=>go(index));}
 $('prev').onclick=()=>navigate(frame-1);$('next').onclick=()=>navigate(frame+1);
-$('timeline').onchange=()=>navigate(Number($('timeline').value));$('overlays').onchange=draw;
+$('timeline').onchange=()=>navigate(Number($('timeline').value));
+function syncMaskVisibility(){
+  const showing=$('overlays').checked;
+  $('toggle-masks').textContent=showing?'Hide masks (H)':'Show masks (H)';
+  $('toggle-masks').setAttribute('aria-pressed',String(!showing));
+  draw();
+}
+function toggleMaskVisibility(){
+  if(!image)return;
+  $('overlays').checked=!$('overlays').checked;syncMaskVisibility();
+  status($('overlays').checked?'Masks shown.':'Masks hidden. Press H or Show masks to reveal them.');
+}
+$('overlays').onchange=syncMaskVisibility;
+$('toggle-masks').onclick=toggleMaskVisibility;
+window.addEventListener('keydown',e=>{
+  const target=document.activeElement;
+  const typing=target.tagName==='TEXTAREA'||target.tagName==='SELECT'||(target.tagName==='INPUT'&&!['checkbox','range','button'].includes(target.type));
+  if(!typing&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&e.key.toLowerCase()==='h'){
+    e.preventDefault();e.stopImmediatePropagation();if(!e.repeat)toggleMaskVisibility();
+  }
+});
 $('class').onchange=()=>{if(draft)dirty=true;updateLabels();controls();};$('object').oninput=()=>{if(draft)dirty=true;};
 $('export').onclick=()=>{if(dirty&&!confirm('Export saved masks only? The current preview has not been saved.'))return;window.location.href=`/api/export?project=${project.id}`;};
-window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
+window.addEventListener('beforeunload',e=>{if(dirty||strokePointer!==null){e.preventDefault();e.returnValue='';}});
 window.addEventListener('resize',applyDisplay);
-window.addEventListener('keydown',e=>{if(busy||['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;const ids={ArrowLeft:'prev',ArrowRight:'next',z:'undo',Z:'undo',Enter:'save'};if(ids[e.key]){e.preventDefault();$(ids[e.key]).click();}});
+window.addEventListener('keydown',e=>{
+  if(busy||['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;
+  if(e.code==='Space'){e.preventDefault();spaceHeld=true;canvas.style.cursor='grab';$('brush-cursor').hidden=true;return;}
+  if(strokePointer!==null||panPointer!==null)return;
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();$(e.shiftKey?'redo-stroke':'undo-stroke').click();return;}
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();$('redo-stroke').click();return;}
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  if(['b','e','p'].includes(e.key.toLowerCase())){setTool({b:'brush',e:'erase',p:'sam'}[e.key.toLowerCase()]);return;}
+  if(e.key==='['||e.key===']'){e.preventDefault();$('brush-size').value=Math.max(1,Math.min(500,Number($('brush-size').value)+(e.key==='['?-5:5)));return;}
+  const ids={ArrowLeft:'prev',ArrowRight:'next',z:activeTool==='sam'?'undo':'undo-stroke',Z:activeTool==='sam'?'undo':'undo-stroke',Enter:'save-mask'};
+  if(ids[e.key]){e.preventDefault();$(ids[e.key]).click();}
+});
+window.addEventListener('keyup',e=>{if(e.code==='Space'){spaceHeld=false;canvas.style.cursor=activeTool==='pan'?'grab':activeTool==='sam'?'crosshair':'none';}});
+window.addEventListener('blur',()=>{spaceHeld=false;if(strokePointer!==null)finishPointer({pointerId:strokePointer});if(panPointer)finishPointer({pointerId:panPointer.id});});
 $('folder').value=localStorage.getItem('labeler-folder')||'';
 renderPalette('new-palette','newcolor');renderPalette('edit-palette','editcolor');
-controls();api('/api/status').then(s=>{$('device').textContent=s.device;}).catch(e=>status(e.message,true));
+syncMaskVisibility();controls();api('/api/status').then(s=>{$('device').textContent=s.device;}).catch(e=>status(e.message,true));

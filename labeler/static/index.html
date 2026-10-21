@@ -15,9 +15,14 @@
 <div class="framebar"><div><strong id="filename">Open a frame folder</strong><span id="dimensions"></span></div><label class="toggle"><input id="overlays" type="checkbox" checked> Show masks</label></div>
 <div class="displaybar"><span>Display size</span><button id="zoomout" aria-label="Zoom out">−</button><label for="zoom" class="sr-only">Display zoom percent</label><input id="zoom" type="number" min="1" max="800" step="5" value="100"><span>%</span><button id="zoomin" aria-label="Zoom in">+</button><button id="fit">Fit to view</button><span class="hint">Original image and export size stay unchanged.</span></div>
 <div class="opacitybar"><label for="opacity">Overlay opacity</label><input id="opacity" type="range" min="0" max="100" step="1" value="45"><output id="opacity-value" for="opacity">45%</output></div>
-<div id="viewport"><div id="empty"><div class="empty-icon">◈</div><h1>Label one frame at a time.</h1><p>Open your sequence, click an object, refine its mask, then save.</p><p class="hint">Left click includes · Right click excludes</p></div><div id="canvas-wrap" hidden><canvas id="canvas" hidden></canvas></div></div>
+<div class="brushbar" role="toolbar" aria-label="Mask editing tools">
+<button id="tool-sam" class="selected" title="SAM point prompts (P)">SAM points</button><button id="tool-brush" title="Paint mask (B)">Brush</button><button id="tool-erase" title="Erase mask (E)">Eraser</button><button id="tool-pan" title="Pan view; or hold Space">Pan</button><button id="toggle-masks" title="Toggle all mask overlays and prompt points (H)">Hide masks (H)</button>
+<label for="brush-size">Size (image px)</label><input id="brush-size" type="number" min="1" max="500" value="25">
+<button id="undo-stroke" title="Undo stroke (Ctrl+Z)">Undo stroke</button><button id="redo-stroke" title="Redo stroke (Ctrl+Shift+Z)">Redo stroke</button><button id="save-mask" class="primary">Save mask</button>
+</div><p id="brush-help" class="brush-help">P: SAM points · B: paint · E: erase · H: hide/show masks · [ ]: brush size · Space + drag: pan. Select Edit mask on a saved object to correct it.</p>
+<div id="brush-cursor" hidden></div><div id="viewport"><div id="empty"><div class="empty-icon">◈</div><h1>Label one frame at a time.</h1><p>Open your sequence, click an object, refine its mask, then save.</p><p class="hint">Left click includes · Right click excludes</p></div><div id="canvas-wrap" hidden><canvas id="canvas" hidden></canvas></div></div>
 <nav><button id="prev">← Previous</button><input id="timeline" type="range" min="0" max="0" value="0" aria-label="Frame"><span id="framecount">0 / 0</span><button id="next">Next →</button></nav>
 <footer><span id="status" role="status" aria-live="polite">Ready. Open a folder to begin.</span><span>← → frames · Z undo · Enter save</span></footer>
 </article>
-</main><script src="/static/app.js"></script>
+</main><script src="/static/brush.js"></script><script src="/static/app.js"></script>
 </body></html>

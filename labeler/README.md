@@ -104,3 +104,30 @@ bash run.sh
 The checkpoint and config must match. Set `LABELER_PYTHON` if your environment
 uses a different Python interpreter. The backend binds to localhost and accesses
 local frame folders; it is intended for personal use on this computer.
+
+## Brush corrections
+
+After a SAM prediction, choose **Brush** (B) to paint or **Eraser** (E) to remove
+mask regions. Size is the circular brush diameter in original-image pixels. Right-drag temporarily erases in either brush mode. [ and ]
+change size. **Undo stroke** / **Redo stroke** (Ctrl+Z / Ctrl+Shift+Z) act on whole
+strokes; history is limited to 30 strokes and approximately 64 MiB of snapshots.
+Use **Pan** or hold Space and drag to move around a zoomed image.
+
+Click **Edit mask** on a saved object to open its actual saved pixels, including
+previous brush corrections. **Save mask** commits the corrected PNG. Unsaved
+corrections trigger a discard prompt on navigation. You may also select Brush
+on a new object and draw a mask without SAM. Empty masks cannot be saved; delete
+the saved object instead. **SAM points** (P) returns to point prompting; running
+SAM again replaces brush corrections after confirmation. **Refine SAM** explicitly
+regenerates a saved mask from its stored prompts. Objects with no positive prompts
+can be corrected with Edit mask or prompted afresh.
+
+Corrections are stored at original resolution as binary PNG masks. JSON records
+`manually_edited: true` and `score: null` for manually saved masks because the old
+model score does not measure the corrected result. Editing does not train SAM 2.
+The editor uses the core CVAT paint/erase workflow; polygon-to-mask and automatic
+removal of overlapping pixels from other objects are not implemented.
+
+Use **Hide masks (H)**, the **Show masks** checkbox, or the H key to toggle
+all saved/draft mask overlays and prompt points. Visibility works after brush
+strokes and while editing; hiding does not change pixels or discard corrections.

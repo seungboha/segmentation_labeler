@@ -1,5 +1,6 @@
 """Local, single-user SAM 2 frame labeler. Run one Uvicorn worker."""
 import base64
+import binascii
 from contextlib import nullcontext
 import hashlib
 import io
@@ -70,7 +71,9 @@ class PredictRequest(BaseModel):
 class SaveRequest(BaseModel):
     project: str
     frame: int = Field(ge=0)
-    draft: str
+    draft: str | None = None
+    mask_png: str | None = Field(default=None, max_length=48000000)
+    points: list[Point] = Field(default_factory=list, max_length=500)
     class_name: str = Field(min_length=1, max_length=100)
     object_id: int | None = Field(default=None, ge=1, le=2147483647)
 
@@ -325,24 +328,41 @@ def predict(req: PredictRequest):
 def save_mask(req: SaveRequest):
     with LOCK:
         p, f = frame_info(req.project, req.frame)
-        if DRAFT is None or (DRAFT["token"], DRAFT["project"], DRAFT["frame"]) != (req.draft, req.project, req.frame):
-            raise HTTPException(409, "Preview is stale. Predict again before saving.")
+        manual = req.mask_png is not None
+        if manual:
+            source = read_frame(p, f)
+            try:
+                data = base64.b64decode(req.mask_png, validate=True)
+                with Image.open(io.BytesIO(data)) as uploaded:
+                    if uploaded.format != "PNG" or uploaded.size != source.size:
+                        raise HTTPException(400, "Edited mask must be a PNG at the original image dimensions.")
+                    mask = np.array(uploaded.convert("L")) > 127
+            except (ValueError, binascii.Error, OSError, Image.DecompressionBombError):
+                raise HTTPException(400, "Edited mask is not a valid PNG.")
+            prompts = [point.model_dump() for point in req.points]
+            if any(not (0 <= point.x < source.width and 0 <= point.y < source.height) for point in req.points):
+                raise HTTPException(400, "Saved prompt coordinates are outside the image.")
+            score = None
+        else:
+            if DRAFT is None or (DRAFT["token"], DRAFT["project"], DRAFT["frame"]) != (req.draft, req.project, req.frame):
+                raise HTTPException(409, "Preview is stale. Predict again before saving.")
+            mask, prompts, score = DRAFT["mask"], DRAFT["points"], DRAFT["score"]
         label = req.class_name.strip()
         if not label:
             raise HTTPException(400, "Enter a class name.")
         if label not in p["labels"]:
             raise HTTPException(400, "Create the label first, then select it before saving.")
-        if not DRAFT["mask"].any():
-            raise HTTPException(400, "The mask is empty. Add a positive point and try again.")
+        if not mask.any():
+            raise HTTPException(400, "The mask is empty. Paint a region or delete the saved object instead.")
         oid = req.object_id or p["next_object_id"]
         key = str(req.frame)
         existing = p["annotations"].get(key, [])
         previous = next((a for a in existing if a["object_id"] == oid), None)
         filename = f"masks/{req.frame:06d}_{oid}_{uuid.uuid4().hex[:12]}.png"
-        (project_dir(p) / filename).write_bytes(png_bytes(DRAFT["mask"]))
+        (project_dir(p) / filename).write_bytes(png_bytes(mask))
         annotation = {"object_id": oid, "class_name": label, "mask_file": filename,
-                      "width": int(DRAFT["mask"].shape[1]), "height": int(DRAFT["mask"].shape[0]),
-                      "points": DRAFT["points"], "score": DRAFT["score"]}
+                      "width": int(mask.shape[1]), "height": int(mask.shape[0]),
+                      "points": prompts, "score": score, "manually_edited": manual}
         updated = {**p, "annotations": {**p["annotations"], key: [a for a in existing if a["object_id"] != oid] + [annotation]},
                    "next_object_id": max(p["next_object_id"], oid + 1)}
         atomic_json(project_dir(p) / "annotations.json", updated)

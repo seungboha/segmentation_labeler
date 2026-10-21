@@ -1,5 +1,6 @@
 """End-to-end check using real SAM inference and temporary source/project files."""
 import io
+import base64
 import json
 import tempfile
 from pathlib import Path
@@ -62,11 +63,34 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         assert client.post("/api/save", json=save).status_code == 409
         result = checked(client.post("/api/predict", json={**request, "frame": 1}))
         checked(client.post("/api/save", json={**save, "frame": 1, "draft": result["draft"], "object_id": 1}))
+        # Brush edits are independent of the latest SAM draft (which is on frame 1).
+        corrected = mask.copy()
+        corrected[10:20, 10:20] = 255
+        corrected[120:130, 145:155] = 0
+        def as_png(array):
+            data = io.BytesIO()
+            Image.fromarray(array).save(data, format="PNG")
+            return base64.b64encode(data.getvalue()).decode()
+        manual = {"project": pid, "frame": 0, "class_name": "circle", "object_id": 1,
+                  "mask_png": as_png(corrected), "points": request["points"]}
+        fixed = checked(client.post("/api/save", json=manual))
+        entry = fixed["annotations"]["0"][0]
+        assert entry["manually_edited"] and entry["score"] is None
+        actual = np.asarray(Image.open(io.BytesIO(client.get("/api/mask/0/1", params={"project": pid}).content)))
+        assert np.array_equal(actual, corrected)
+        assert client.post("/api/save", json={**manual, "mask_png": "invalid"}).status_code == 400
+        assert client.post("/api/save", json={**manual, "mask_png": as_png(np.zeros((10, 10), dtype=np.uint8))}).status_code == 400
+        assert client.post("/api/save", json={**manual, "mask_png": as_png(np.zeros_like(corrected))}).status_code == 400
+        checked(client.post("/api/open", json={"folder": str(frames)}))
+        actual = np.asarray(Image.open(io.BytesIO(client.get("/api/mask/0/1", params={"project": pid}).content)))
+        assert np.array_equal(actual, corrected)
         export = client.get("/api/export", params={"project": pid})
         assert export.status_code == 200
         with zipfile.ZipFile(io.BytesIO(export.content)) as archive:
             metadata = json.loads(archive.read("annotations.json"))
             assert len(metadata["annotations"]) == 2
+            exported_mask = Image.open(io.BytesIO(archive.read(metadata["annotations"]["0"][0]["mask_file"])))
+            assert np.array_equal(np.asarray(exported_mask), corrected)
             assert metadata["labels"] == ["circle", "unused label"]
             assert metadata["label_colors"]["circle"] == "#f46d6d" and metadata["overlay_opacity"] == 0.7
             assert len([n for n in archive.namelist() if n.endswith(".png")]) == 2
@@ -104,4 +128,5 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         print("PASS: folder import, nested images, ignored non-images, duplicate selection resumes labels, invalid image/path rejection")
         print("PASS: label creation, duplicate rejection, unused label persistence, exported registry, old-project migration")
         print("PASS: manual label colors and opacity persist and export; binary PNG masks remain unchanged")
+        print("PASS: brush corrections, erased holes, original-size binary export, reopen, malformed/wrong-size/empty mask rejection")
         print("PASS: real GPU inference, natural frame ordering, PNG masks, save/resume, manual ID reuse, export, delete, stale requests, changed-source protection")

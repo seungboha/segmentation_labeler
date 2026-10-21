@@ -31,3 +31,5 @@ canvas{display:block;flex:none;max-width:none;max-height:none;object-fit:fill}
 #color-label{font-size:12px;overflow-wrap:anywhere}
 .opacitybar{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);padding-bottom:12px}
 .opacitybar label{margin:0}.opacitybar input{width:150px;accent-color:var(--accent)}.opacitybar output{width:36px}
+
+.brushbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding-bottom:7px}.brushbar button{font-size:12px;padding:6px 9px}.brushbar label{margin:0;font-size:11px}.brushbar input#brush-size{width:65px;padding:6px;font-size:12px}.brushbar select{width:85px;padding:6px;font-size:12px}.brush-help{color:var(--muted);font-size:11px;margin:0 0 10px}#brush-cursor{position:fixed;pointer-events:none;z-index:1000;border:1px solid white;box-shadow:0 0 0 1px #10151c;transform:translate(-50%,-50%)}#brush-cursor.eraser{border-color:#ff718a}.object .row{flex-wrap:wrap}#viewport{min-height:120px}
