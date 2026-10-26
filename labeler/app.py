@@ -1,7 +1,6 @@
-"""Local, single-user SAM 2 frame labeler. Run one Uvicorn worker."""
+"""Local, single-user mask editor. Run one Uvicorn worker."""
 import base64
 import binascii
-from contextlib import nullcontext
 import hashlib
 import io
 import json
@@ -19,19 +18,23 @@ from PIL import Image, ImageOps
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
+import mask_history
+import cvat_import
+from sam_assist import SamAssist, SamUnavailable
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LABELER_DATA", ROOT / "projects"))
 LOCK = threading.RLock()
 ACTIVE = None
-PREDICTOR = None
-EMBEDDED = None
-DRAFT = None
+PENDING_IMPORT = None
+SAM = SamAssist(ROOT)
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-app = FastAPI(title="SAM 2 Frame Labeler")
+DEFAULT_LABEL_COLORS = {"teeth_gum": "#68ddbc", "soft_tissue": "#ff91ac",
+                        "glove": "#82b6ff", "unusable_region": "#f6bf70", "background": "#95a4b9"}
+app = FastAPI(title="Frame Mask Editor")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
@@ -68,14 +71,30 @@ class PredictRequest(BaseModel):
     points: list[Point] = Field(min_length=1, max_length=500)
 
 
+class PresetRequest(BaseModel):
+    project: str
+
+
 class SaveRequest(BaseModel):
     project: str
     frame: int = Field(ge=0)
-    draft: str | None = None
-    mask_png: str | None = Field(default=None, max_length=48000000)
-    points: list[Point] = Field(default_factory=list, max_length=500)
+    mask: str = Field(min_length=1, max_length=100_000_000,
+                      validation_alias=AliasChoices("mask", "mask_png"))
     class_name: str = Field(min_length=1, max_length=100)
     object_id: int | None = Field(default=None, ge=1, le=2147483647)
+    sam_points: list[Point] = Field(default_factory=list, max_length=500,
+                                  validation_alias=AliasChoices("sam_points", "points"))
+
+
+class VersionRequest(BaseModel):
+    project: str
+    name: str = Field(min_length=1, max_length=100)
+    note: str = Field(default="", max_length=2000)
+
+
+class ApplyImportRequest(BaseModel):
+    project: str
+    token: str
 
 
 def atomic_json(path, data):
@@ -111,22 +130,23 @@ def project_dir(p):
 
 
 def public_project(p):
-    return {**p, "save_directory": str(project_dir(p))}
+    return {**p, "save_directory": str(project_dir(p)),
+            "mask_versions": mask_history.list_versions(project_dir(p))}
 
 
-def get_predictor():
-    global PREDICTOR
-    if PREDICTOR is None:
-        import torch
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
-        checkpoint = os.environ.get("SAM2_CHECKPOINT", str(ROOT.parent / "sam2/checkpoints/sam2.1_hiera_tiny.pt"))
-        config = os.environ.get("SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_t.yaml")
-        if not Path(checkpoint).is_file():
-            raise HTTPException(503, "Checkpoint missing. Set SAM2_CHECKPOINT to its WSL path.")
-        device = os.environ.get("SAM2_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-        PREDICTOR = SAM2ImagePredictor(build_sam2(config, checkpoint, device=device))
-    return PREDICTOR
+def decode_mask(data, size):
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            mask = ImageOps.exif_transpose(source)
+            if mask.size != size:
+                raise HTTPException(400, f"Mask must match the frame dimensions: {size[0]} x {size[1]}.")
+            # Preserve low-valued foreground (e.g. 0/1 and 16-bit masks).
+            if mask.mode in ("1", "L", "I", "F") or mask.mode.startswith("I;16"):
+                return np.asarray(mask) != 0
+            rgba = np.asarray(mask.convert("RGBA"))
+            return np.any(rgba[:, :, :3] != 0, axis=2) & (rgba[:, :, 3] != 0)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        raise HTTPException(400, "Cannot read mask. Choose a valid mask image.")
 
 
 def png_bytes(mask):
@@ -137,22 +157,34 @@ def png_bytes(mask):
 
 @app.get("/")
 def home():
-    return FileResponse(ROOT / "static/index.html")
+    # A cached SAM frontend can understand the prediction PNG but not the save
+    # protocol. Serve fresh HTML and give every asset a content-specific URL.
+    html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "style.css", "controls.css"):
+        version = hashlib.sha256((ROOT / "static" / name).read_bytes()).hexdigest()[:16]
+        html = html.replace(f'/static/{name}"', f'/static/{name}?v={version}"')
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.middleware("http")
+async def revalidate_assets(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 @app.get("/api/status")
 def status():
-    import torch
-    return {"device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
-            "model": "SAM 2 image predictor", "loaded": PREDICTOR is not None}
+    return {"device": "Mask editor · SAM2 optional", "sam2": SAM.status()}
 
 
 @app.post("/api/open")
 def open_project(req: OpenRequest):
-    global ACTIVE, EMBEDDED, DRAFT
+    global ACTIVE
     with LOCK:
         folder_text = req.folder.strip().strip('"')
-        if re.match(r"^[A-Za-z]:[\\/]", folder_text):
+        if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", folder_text):
             folder_text = "/mnt/" + folder_text[0].lower() + "/" + folder_text[3:].replace("\\", "/")
         else:
             folder_text = folder_text.replace("\\", "/")
@@ -175,7 +207,8 @@ def open_project(req: OpenRequest):
             dest.mkdir(parents=True, exist_ok=True)
             (dest / "masks").mkdir(exist_ok=True)
             p = {"version": 1, "id": pid, "source_folder": str(folder), "frames": frames,
-                 "annotations": {}, "next_object_id": 1}
+                 "annotations": {}, "next_object_id": 1,
+                 "labels": list(DEFAULT_LABEL_COLORS), "label_colors": dict(DEFAULT_LABEL_COLORS)}
             atomic_json(manifest, p)
         # Older projects stored class names only on saved annotations.
         labels = list(dict.fromkeys(p.get("labels", []) + [a["class_name"] for entries in p["annotations"].values() for a in entries]))
@@ -184,7 +217,9 @@ def open_project(req: OpenRequest):
         if p.get("labels") != labels or p.get("label_colors") != colors or "overlay_opacity" not in p:
             p.update(labels=labels, label_colors=colors, overlay_opacity=opacity)
             atomic_json(manifest, p)
-        ACTIVE, EMBEDDED, DRAFT = p, None, None
+        clear_pending_import()
+        SAM.embedded = None
+        ACTIVE = p
         return public_project(p)
 
 
@@ -198,6 +233,21 @@ def add_label(req: LabelRequest):
         if any(label.casefold() == name.casefold() for label in p["labels"]):
             raise HTTPException(409, "This label already exists. Select it from the list.")
         updated = {**p, "labels": [*p["labels"], name], "label_colors": {**p["label_colors"], name: req.color.lower()}}
+        atomic_json(project_dir(p) / "annotations.json", updated)
+        p.update(updated)
+        return public_project(p)
+
+
+@app.post("/api/labels/dental-preset")
+def dental_labels(req: PresetRequest):
+    with LOCK:
+        p = require_project(req.project)
+        labels, colors = list(p["labels"]), dict(p["label_colors"])
+        for name, color in DEFAULT_LABEL_COLORS.items():
+            if not any(label.casefold() == name.casefold() for label in labels):
+                labels.append(name)
+                colors[name] = color
+        updated = {**p, "labels": labels, "label_colors": colors}
         atomic_json(project_dir(p) / "annotations.json", updated)
         p.update(updated)
         return public_project(p)
@@ -288,72 +338,161 @@ def get_frame(index: int, project: str):
         return Response(stream.getvalue(), media_type="image/png")
 
 
+@app.post("/api/load-mask")
+async def load_mask(request: Request):
+    async with request.form(max_files=1, max_fields=2) as form:
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            raise HTTPException(400, "Choose a mask image.")
+        try:
+            index = int(form.get("frame", ""))
+        except (ValueError, TypeError):
+            raise HTTPException(400, "Select a valid frame.")
+        data = await upload.read()
+        def preview():
+            with LOCK:
+                p, f = frame_info(str(form.get("project", "")), index)
+                mask = decode_mask(data, read_frame(p, f).size)
+                return {"mask": base64.b64encode(png_bytes(mask)).decode(), "pixels": int(mask.sum())}
+        return await run_in_threadpool(preview)
+
+
+def clear_pending_import():
+    global PENDING_IMPORT
+    if PENDING_IMPORT is not None:
+        PENDING_IMPORT["temporary"].cleanup()
+        PENDING_IMPORT = None
+
+
+def project_signature(p):
+    return hashlib.sha256(json.dumps(p, sort_keys=True).encode()).hexdigest()
+
+
+@app.post("/api/import/cvat/preview")
+async def preview_cvat(request: Request):
+    async with request.form(max_files=1, max_fields=1) as form:
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile):
+            raise HTTPException(400, "Choose a CVAT XML file.")
+        data = await upload.read(64 * 1024 * 1024 + 1)
+        if len(data) > 64 * 1024 * 1024:
+            raise HTTPException(400, "CVAT XML must be 64 MiB or smaller.")
+        return await run_in_threadpool(stage_cvat, str(form.get("project", "")), data, upload.filename or "annotations.xml")
+
+
+def stage_cvat(project, data, filename):
+    global PENDING_IMPORT
+    with LOCK:
+        p = require_project(project)
+        clear_pending_import()
+        temporary = tempfile.TemporaryDirectory(prefix="cvat-import-", dir=project_dir(p))
+        try:
+            staged = cvat_import.stage(data, p["frames"], lambda index: read_frame(p, p["frames"][index]).size,
+                                       Path(temporary.name))
+        except Exception as error:
+            temporary.cleanup()
+            if isinstance(error, cvat_import.ImportError):
+                raise HTTPException(400, str(error))
+            raise
+        token = uuid.uuid4().hex
+        PENDING_IMPORT = {**staged, "temporary": temporary, "token": token, "project": p["id"],
+                          "signature": project_signature(p), "filename": PurePosixPath(filename.replace("\\", "/")).name,
+                          "sha256": hashlib.sha256(data).hexdigest()}
+        return {"token": token, "filename": PENDING_IMPORT["filename"], **staged["summary"]}
+
+
+@app.delete("/api/import/cvat/{token}")
+def cancel_cvat(token: str, project: str):
+    with LOCK:
+        require_project(project)
+        if PENDING_IMPORT and PENDING_IMPORT["project"] == project and PENDING_IMPORT["token"] == token:
+            clear_pending_import()
+        return {"cancelled": True}
+
+
+@app.post("/api/import/cvat/apply")
+def apply_cvat(req: ApplyImportRequest):
+    with LOCK:
+        p = require_project(req.project)
+        pending = PENDING_IMPORT
+        if not pending or pending["project"] != p["id"] or pending["token"] != req.token:
+            raise HTTPException(409, "Import preview expired. Choose the XML file again.")
+        if pending["signature"] != project_signature(p):
+            raise HTTPException(409, "Project changed after the preview. Choose the XML file again.")
+        updated = json.loads(json.dumps(p))
+        canonical = {name.casefold(): name for name in updated["labels"]}
+        for name in pending["summary"]["labels"]:
+            if name.casefold() not in canonical:
+                canonical[name.casefold()] = name
+                updated["labels"].append(name)
+                updated["label_colors"][name] = pending["colors"].get(name, "#68ddbc")
+        tracks, written = {}, []
+        try:
+            for item in pending["items"]:
+                track_key = (item["track"], item["label"].casefold()) if item["track"] is not None else None
+                oid = tracks.get(track_key) if track_key is not None else None
+                if oid is None:
+                    oid = updated["next_object_id"]
+                    if oid > 2147483647:
+                        raise HTTPException(400, "No object IDs are available for this import.")
+                    updated["next_object_id"] += 1
+                    if track_key is not None:
+                        tracks[track_key] = oid
+                filename = f"masks/{item['frame']:06d}_{oid}_{uuid.uuid4().hex[:12]}.png"
+                target = project_dir(p) / filename
+                written.append(target)
+                shutil.copyfile(Path(pending["temporary"].name) / item["file"], target)
+                annotation = {"object_id": oid, "class_name": canonical[item["label"].casefold()],
+                              "mask_file": filename, "width": item["width"], "height": item["height"],
+                              "source": "cvat", "cvat": {"file": pending["filename"], "sha256": pending["sha256"],
+                                "image": item["image_name"], "group_id": item["group"], "track_id": item["track"]}}
+                updated["annotations"].setdefault(str(item["frame"]), []).append(annotation)
+            atomic_json(project_dir(p) / "annotations.json", updated)
+        except Exception:
+            for path in written:
+                path.unlink(missing_ok=True)
+            raise
+        p.update(updated)
+        summary = pending["summary"]
+        clear_pending_import()
+        return {"project": public_project(p), "summary": summary}
+
+
 @app.post("/api/predict")
 def predict(req: PredictRequest):
-    global EMBEDDED, DRAFT
     with LOCK:
         p, f = frame_info(req.project, req.frame)
         image = read_frame(p, f)
-        for point in req.points:
-            if not (0 <= point.x < image.width and 0 <= point.y < image.height):
-                raise HTTPException(400, "Click coordinates are outside the image.")
-        if not any(point.label for point in req.points):
-            raise HTTPException(400, "Add at least one positive point inside the object.")
-        import torch
+        if any(not (0 <= point.x < image.width and 0 <= point.y < image.height) for point in req.points):
+            raise HTTPException(400, "Prompt coordinates are outside the image.")
+        if not any(point.label == 1 for point in req.points):
+            raise HTTPException(400, "Add an include point inside the desired region first.")
         try:
-            predictor = get_predictor()
-            autocast = torch.autocast("cuda", dtype=torch.bfloat16) if predictor.device.type == "cuda" and torch.cuda.is_bf16_supported() else nullcontext()
-            with torch.inference_mode(), autocast:
-                if EMBEDDED != (p["id"], req.frame):
-                    predictor.set_image(np.array(image, copy=True))
-                    EMBEDDED = (p["id"], req.frame)
-                masks, scores, _ = predictor.predict(
-                    point_coords=np.array([[pt.x, pt.y] for pt in req.points], dtype=np.float32),
-                    point_labels=np.array([pt.label for pt in req.points], dtype=np.int32),
-                    multimask_output=True)
-            best = int(np.argmax(scores))
-            mask = masks[best].astype(bool)
-            token = uuid.uuid4().hex
-            DRAFT = {"token": token, "project": p["id"], "frame": req.frame, "mask": mask,
-                     "points": [pt.model_dump() for pt in req.points], "score": float(scores[best])}
-            return {"draft": token, "mask": base64.b64encode(png_bytes(mask)).decode(),
-                    "score": DRAFT["score"], "pixels": int(mask.sum())}
-        except torch.cuda.OutOfMemoryError:
-            EMBEDDED, DRAFT = None, None
-            torch.cuda.empty_cache()
-            raise HTTPException(503, "GPU memory is full. Close other GPU applications and retry.")
+            mask, score, device = SAM.predict(image, (p["id"], req.frame), req.points)
+        except SamUnavailable as error:
+            raise HTTPException(503, str(error))
+        return {"mask": base64.b64encode(png_bytes(mask)).decode(), "score": score,
+                "pixels": int(mask.sum()), "device": device}
 
 
 @app.post("/api/save")
 def save_mask(req: SaveRequest):
     with LOCK:
         p, f = frame_info(req.project, req.frame)
-        manual = req.mask_png is not None
-        if manual:
-            source = read_frame(p, f)
-            try:
-                data = base64.b64decode(req.mask_png, validate=True)
-                with Image.open(io.BytesIO(data)) as uploaded:
-                    if uploaded.format != "PNG" or uploaded.size != source.size:
-                        raise HTTPException(400, "Edited mask must be a PNG at the original image dimensions.")
-                    mask = np.array(uploaded.convert("L")) > 127
-            except (ValueError, binascii.Error, OSError, Image.DecompressionBombError):
-                raise HTTPException(400, "Edited mask is not a valid PNG.")
-            prompts = [point.model_dump() for point in req.points]
-            if any(not (0 <= point.x < source.width and 0 <= point.y < source.height) for point in req.points):
-                raise HTTPException(400, "Saved prompt coordinates are outside the image.")
-            score = None
-        else:
-            if DRAFT is None or (DRAFT["token"], DRAFT["project"], DRAFT["frame"]) != (req.draft, req.project, req.frame):
-                raise HTTPException(409, "Preview is stale. Predict again before saving.")
-            mask, prompts, score = DRAFT["mask"], DRAFT["points"], DRAFT["score"]
+        try:
+            data = base64.b64decode(req.mask, validate=True)
+        except (ValueError, binascii.Error):
+            raise HTTPException(400, "Invalid mask encoding.")
+        mask = decode_mask(data, read_frame(p, f).size)
+        if any(not (0 <= point.x < mask.shape[1] and 0 <= point.y < mask.shape[0]) for point in req.sam_points):
+            raise HTTPException(400, "Saved SAM2 prompt coordinates are outside the image.")
         label = req.class_name.strip()
         if not label:
             raise HTTPException(400, "Enter a class name.")
         if label not in p["labels"]:
             raise HTTPException(400, "Create the label first, then select it before saving.")
         if not mask.any():
-            raise HTTPException(400, "The mask is empty. Paint a region or delete the saved object instead.")
+            raise HTTPException(400, "The mask is empty. Paint foreground before saving.")
         oid = req.object_id or p["next_object_id"]
         key = str(req.frame)
         existing = p["annotations"].get(key, [])
@@ -362,7 +501,9 @@ def save_mask(req: SaveRequest):
         (project_dir(p) / filename).write_bytes(png_bytes(mask))
         annotation = {"object_id": oid, "class_name": label, "mask_file": filename,
                       "width": int(mask.shape[1]), "height": int(mask.shape[0]),
-                      "points": prompts, "score": score, "manually_edited": manual}
+                      "source": "sam2-assisted" if req.sam_points else "manual"}
+        if req.sam_points:
+            annotation["sam_points"] = [point.model_dump() for point in req.sam_points]
         updated = {**p, "annotations": {**p["annotations"], key: [a for a in existing if a["object_id"] != oid] + [annotation]},
                    "next_object_id": max(p["next_object_id"], oid + 1)}
         atomic_json(project_dir(p) / "annotations.json", updated)
@@ -409,3 +550,26 @@ def export(project: str):
                     archive.write(project_dir(p) / annotation["mask_file"], annotation["mask_file"])
             archive.writestr("README.txt", "Each PNG is an independent object mask: 0=background, 255=foreground.\nFrame indices in annotations.json are zero-based and map to frames[].name.\nMasks have the EXIF-oriented source image dimensions. Object masks may overlap.\nClass names are user-defined. Source images are not included.\n")
         return Response(stream.getvalue(), media_type="application/zip", headers={"Content-Disposition": 'attachment; filename="labeler-annotations.zip"'})
+
+
+@app.post("/api/versions")
+def save_version(req: VersionRequest):
+    with LOCK:
+        p = require_project(req.project)
+        name = " ".join(req.name.split())
+        if not name:
+            raise HTTPException(400, "Enter a version name.")
+        mask_history.save_version(project_dir(p), p, name, req.note.strip())
+        return public_project(p)
+
+
+@app.get("/api/versions/{version_id}/export")
+def export_version(version_id: str, project: str):
+    with LOCK:
+        p = require_project(project)
+        try:
+            data = mask_history.export_version(project_dir(p), version_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "Version not found.")
+        return Response(data, media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="mask-version-{version_id[:8]}.zip"'})

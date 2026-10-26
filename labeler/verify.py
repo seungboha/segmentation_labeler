@@ -1,6 +1,5 @@
-"""End-to-end check using real SAM inference and temporary source/project files."""
+"""End-to-end mask import, manual editing, persistence and export checks."""
 import io
-import base64
 import json
 import tempfile
 from pathlib import Path
@@ -28,11 +27,18 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         draw.ellipse((70, 50, 240, 210), fill="#c84040", outline="#631515", width=5)
         image.save(frames / f"frame{number}.png")
     with TestClient(backend.app) as client:
-        assert client.get("/").status_code == 200
+        home = client.get("/", headers={"If-Modified-Since": "Thu, 31 Dec 2099 23:59:59 GMT"})
+        assert home.status_code == 200 and home.headers["cache-control"] == "no-store"
+        assert '/static/app.js?v=' in home.text
+        assert '/static/controls.css?v=' in home.text
+        script = client.get("/static/app.js")
+        assert script.headers["cache-control"] == "no-cache, must-revalidate"
         p = checked(client.post("/api/open", json={"folder": str(frames)}))
         assert [f["name"] for f in p["frames"]] == ["frame2.png", "frame10.png"]
         pid = p["id"]
-        assert p["labels"] == []
+        defaults = list(backend.DEFAULT_LABEL_COLORS)
+        assert p["labels"] == defaults
+        assert p["label_colors"] == backend.DEFAULT_LABEL_COLORS
         p = checked(client.post("/api/labels", json={"project": pid, "name": "circle", "color": "#82B6FF"}))
         assert p["label_colors"]["circle"] == "#82b6ff"
         checked(client.post("/api/labels", json={"project": pid, "name": "unused label"}))
@@ -40,14 +46,37 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         assert client.post("/api/labels", json={"project": pid, "name": "  "}).status_code == 400
         assert client.get("/api/frame/0", params={"project": pid}).status_code == 200
         assert client.get("/api/frame/99", params={"project": pid}).status_code == 404
-        request = {"project": pid, "frame": 0, "points": [{"x": 150, "y": 125, "label": 1}, {"x": 20, "y": 20, "label": 0}]}
-        assert client.post("/api/predict", json={**request, "project": "stale"}).status_code == 409
-        result = checked(client.post("/api/predict", json=request))
-        assert result["pixels"] > 0
-        save = {"project": pid, "frame": 0, "draft": result["draft"], "class_name": "circle"}
+        buffer = io.BytesIO()
+        source = np.zeros((240, 320), dtype=np.uint8)
+        source[50:150, 70:200] = 1
+        Image.fromarray(source).save(buffer, format="PNG")
+        def load_mask(pid=pid, index=0, content=None):
+            return client.post("/api/load-mask", data={"project": pid, "frame": str(index)},
+                               files={"file": ("mask.png", buffer.getvalue() if content is None else content, "image/png")})
+        assert load_mask(pid="stale").status_code == 409
+        assert load_mask(index=99).status_code == 404
+        assert load_mask(content=b"bad image").status_code == 400
+        wrong = io.BytesIO()
+        Image.new("L", (10, 10), 255).save(wrong, format="PNG")
+        assert load_mask(content=wrong.getvalue()).status_code == 400
+        result = checked(load_mask())
+        assert result["pixels"] == 13000
+        save = {"project": pid, "frame": 0, "mask": result["mask"], "class_name": "circle"}
         assert client.post("/api/save", json={**save, "class_name": "unknown"}).status_code == 400
+        assert client.post("/api/save", json={**save, "mask": "!!!"}).status_code == 400
         p = checked(client.post("/api/save", json=save))
         assert p["annotations"]["0"][0]["object_id"] == 1
+        # Older brush/SAM frontends send mask_png and points, with a null draft.
+        legacy_points = [{"x": 150, "y": 125, "label": 1}, {"x": 20, "y": 20, "label": 0}]
+        legacy_save = {"project": pid, "frame": 0, "mask_png": save["mask"],
+                       "points": legacy_points, "draft": None, "class_name": "circle", "object_id": 1}
+        p = checked(client.post("/api/save", json=legacy_save))
+        assert len(p["annotations"]["0"]) == 1
+        assert p["annotations"]["0"][0]["sam_points"] == legacy_points
+        assert client.post("/api/save", json={**legacy_save, "mask_png": "!!!"}).status_code == 400
+        assert client.post("/api/save", json={**legacy_save, "points": [{"x": -1, "y": 0, "label": 1}]}).status_code == 400
+        missing_mask = {key: value for key, value in legacy_save.items() if key != "mask_png"}
+        assert client.post("/api/save", json=missing_mask).status_code == 422
         png = client.get("/api/mask/0/1", params={"project": pid}).content
         mask = np.asarray(Image.open(io.BytesIO(png)))
         assert mask.shape == (240, 320) and set(np.unique(mask)).issubset({0, 255})
@@ -58,40 +87,27 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         assert client.patch("/api/overlay", json={"project": pid, "opacity": 1.5}).status_code == 422
         p = checked(client.post("/api/open", json={"folder": str(frames)}))
         assert p["annotations"]["0"][0]["class_name"] == "circle"
-        assert p["labels"] == ["circle", "unused label"]
+        assert p["labels"] == defaults + ["circle", "unused label"]
         assert p["label_colors"]["circle"] == "#f46d6d" and p["overlay_opacity"] == 0.7
-        assert client.post("/api/save", json=save).status_code == 409
-        result = checked(client.post("/api/predict", json={**request, "frame": 1}))
-        checked(client.post("/api/save", json={**save, "frame": 1, "draft": result["draft"], "object_id": 1}))
-        # Brush edits are independent of the latest SAM draft (which is on frame 1).
-        corrected = mask.copy()
-        corrected[10:20, 10:20] = 255
-        corrected[120:130, 145:155] = 0
-        def as_png(array):
-            data = io.BytesIO()
-            Image.fromarray(array).save(data, format="PNG")
-            return base64.b64encode(data.getvalue()).decode()
-        manual = {"project": pid, "frame": 0, "class_name": "circle", "object_id": 1,
-                  "mask_png": as_png(corrected), "points": request["points"]}
-        fixed = checked(client.post("/api/save", json=manual))
-        entry = fixed["annotations"]["0"][0]
-        assert entry["manually_edited"] and entry["score"] is None
+        # Edit actual saved pixels and replace the same object.
+        edited = mask.copy()
+        edited[60:80, 80:100] = 0
+        edited[170:180, 200:210] = 255
+        output = io.BytesIO()
+        Image.fromarray(edited).save(output, format="PNG")
+        import base64
+        edited_mask = base64.b64encode(output.getvalue()).decode()
+        p = checked(client.post("/api/save", json={**save, "mask": edited_mask, "object_id": 1}))
+        assert len(p["annotations"]["0"]) == 1
         actual = np.asarray(Image.open(io.BytesIO(client.get("/api/mask/0/1", params={"project": pid}).content)))
-        assert np.array_equal(actual, corrected)
-        assert client.post("/api/save", json={**manual, "mask_png": "invalid"}).status_code == 400
-        assert client.post("/api/save", json={**manual, "mask_png": as_png(np.zeros((10, 10), dtype=np.uint8))}).status_code == 400
-        assert client.post("/api/save", json={**manual, "mask_png": as_png(np.zeros_like(corrected))}).status_code == 400
-        checked(client.post("/api/open", json={"folder": str(frames)}))
-        actual = np.asarray(Image.open(io.BytesIO(client.get("/api/mask/0/1", params={"project": pid}).content)))
-        assert np.array_equal(actual, corrected)
+        assert np.array_equal(actual, edited)
+        checked(client.post("/api/save", json={**save, "frame": 1, "object_id": 1}))
         export = client.get("/api/export", params={"project": pid})
         assert export.status_code == 200
         with zipfile.ZipFile(io.BytesIO(export.content)) as archive:
             metadata = json.loads(archive.read("annotations.json"))
             assert len(metadata["annotations"]) == 2
-            exported_mask = Image.open(io.BytesIO(archive.read(metadata["annotations"]["0"][0]["mask_file"])))
-            assert np.array_equal(np.asarray(exported_mask), corrected)
-            assert metadata["labels"] == ["circle", "unused label"]
+            assert metadata["labels"] == defaults + ["circle", "unused label"]
             assert metadata["label_colors"]["circle"] == "#f46d6d" and metadata["overlay_opacity"] == 0.7
             assert len([n for n in archive.namelist() if n.endswith(".png")]) == 2
         checked(client.delete("/api/mask/0/1", params={"project": pid}))
@@ -108,8 +124,7 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         checked(client.post("/api/labels", json={"project": imported["id"], "name": "circle"}))
         assert len(imported["frames"]) == 2
         assert client.get("/api/frame/1", params={"project": imported["id"]}).status_code == 200
-        imported_prediction = checked(client.post("/api/predict", json={**request, "project": imported["id"]}))
-        checked(client.post("/api/save", json={**save, "project": imported["id"], "draft": imported_prediction["draft"]}))
+        checked(client.post("/api/save", json={**save, "project": imported["id"]}))
         reopened = checked(import_images())
         assert reopened["id"] == imported["id"]
         assert reopened["annotations"]["0"][0]["class_name"] == "circle"
@@ -128,5 +143,4 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         print("PASS: folder import, nested images, ignored non-images, duplicate selection resumes labels, invalid image/path rejection")
         print("PASS: label creation, duplicate rejection, unused label persistence, exported registry, old-project migration")
         print("PASS: manual label colors and opacity persist and export; binary PNG masks remain unchanged")
-        print("PASS: brush corrections, erased holes, original-size binary export, reopen, malformed/wrong-size/empty mask rejection")
-        print("PASS: real GPU inference, natural frame ordering, PNG masks, save/resume, manual ID reuse, export, delete, stale requests, changed-source protection")
+        print("PASS: mask import and manual pixel replacement, natural frame ordering, PNG masks, save/resume, manual ID reuse, export, delete, stale project requests, changed-source protection")

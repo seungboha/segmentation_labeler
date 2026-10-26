@@ -1,133 +1,190 @@
-# SAM 2 frame labeler
+# Frame mask editor
 
-Local Python backend and browser canvas for labeling individual frames with SAM 2.
-No tracking or video propagation. Uses the installed SAM package in your `sam`
-Conda environment and `../sam2/checkpoints/sam2.1_hiera_tiny.pt` by default.
+Local Python backend and browser canvas for loading, editing and SAM2-assisted
+annotation of object masks. Manual editing and CVAT import work without a model.
 
-## Start in WSL Ubuntu
+## Start
 
-```bash
-cd /home/seungbo/projects/Labeler/labeler
-bash run.sh
+Install Python dependencies and start one server worker:
+
+```sh
+python -m pip install -r requirements.txt
+python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Open http://localhost:8000 in your Windows browser. Keep the terminal running;
-Ctrl+C stops the server. One server worker and one active labeling browser are
-supported. The model loads at the first prediction; frame embeddings are reused
-for subsequent clicks on the same frame.
+Open http://localhost:8000. On Linux / WSL, `bash run.sh` also starts the server
+with `python3`; set `LABELER_PYTHON` to use another interpreter. `PORT` defaults
+to 8000. `python start_background.py` runs detached and writes server.log and
+server.pid. The app supports one active labeling browser.
 
-Alternatively, run `python start_background.py` in the SAM environment to keep
-the server running after the launching terminal closes. Its log is `server.log`;
-its process ID is in `server.pid`. Stop that server in WSL with
-`kill "$(cat server.pid)"` from this directory before starting another one.
+## Load and edit masks
 
-To try the included sample sequence, run `python make_demo.py` in the SAM
-environment and open `/home/seungbo/projects/Labeler/labeler/demo_frames` in the UI.
+1. Choose an image folder, or open a Windows / WSL folder path. Images in
+   subfolders are naturally sorted. Selecting the same unchanged folder resumes
+   saved annotations. Browser-selected images are copied into project storage.
+2. New projects start with teeth_gum, soft_tissue, glove, unusable_region and
+   background. Select one from the label list, or add a custom label and color.
+3. Click **Load mask for this frame** and select a PNG, TIFF, BMP, or WebP mask.
+   Each file represents one object: zero / black is background and nonzero pixels
+   are foreground. Transparent pixels are background. Multi-valued masks are
+   treated as one foreground object. The mask must match the EXIF-oriented frame
+   dimensions exactly; it is never resized. Loading creates an unsaved preview.
+4. Drag with **Brush** to add foreground or **Eraser** to remove it. Right drag
+   also erases. Brush diameter is measured in original image pixels, independent
+   of zoom. **Undo edit** (Z) restores up to 20 edits, including **Clear mask**.
+   You can also paint a new mask from scratch.
+5. Click **Save object** (Enter) to commit. An object ID is assigned automatically;
+   reuse an ID across frames to identify the same object manually. Click
+   **Edit mask** on a saved object to edit its actual pixels, including masks
+   from older projects. Save replaces that object's mask on the current frame.
+6. Navigate with Previous / Next, the slider, or arrow keys. Unsaved changes
+   trigger a discard prompt. Download masks and JSON when ready.
 
-If dependencies are missing, install them in the existing SAM environment:
+Display zoom, fit to view, label colors, and overlay opacity affect previews.
+PNG exports always retain the original dimensions and binary values 0 / 255.
+Independent object masks may overlap. Empty masks cannot be saved; use Delete
+on a saved object to remove it.
 
-```bash
-/home/seungbo/anaconda3/envs/sam/bin/python -m pip install -r requirements.txt
+## Storage and verification
+
+Projects live in `projects/<folder-hash>/annotations.json`, with PNGs under
+`masks/`. Set `LABELER_DATA` to change storage. Exports include annotations,
+labels, colors, opacity and masks; original images are excluded. Older saved
+annotations remain readable. Edited annotations record `source: manual` or
+`source: sam2-assisted` when SAM2 prompt provenance is provided.
+Keep source frames unchanged; changed frame sequences must use a new folder.
+
+Run `python -m pip install httpx` and `python verify.py` for backend checks.
+
+## Versions of the complete mask set
+
+Use **Mask versions → Save version…** to give the complete saved mask set a
+name, such as Wide or Narrow, and an optional note. Each checkpoint includes all
+frames, saved objects, labels, colors and opacity. Save or discard any unsaved
+object edits in the dialog first. **Save object** updates the working mask;
+**Save version** creates an immutable checkpoint. Existing projects need no migration.
+
+The version list shows each name, timestamp and mask count. Its **Export** button
+downloads that checkpoint as a complete ZIP of original-resolution binary PNGs
+plus JSON, even after working masks are edited or deleted. Version loading,
+switching, restoration and deletion are not implemented. Current working-mask
+downloads continue to use **Download masks + JSON**.
+
+History is stored inside `projects/<project-id>/history/`:
+
+```text
+history/
+  versions/<version-id>.json   # Complete project manifest and checkpoint metadata
+  blobs/<pixel-hash>.json      # Shared mask format and dependency metadata
+  blobs/<pixel-hash>.png       # Full binary mask, or:
+  blobs/<pixel-hash>.npz       # Compressed, bit-packed XOR changes within a rectangle
 ```
 
-## Label frames
+Identical masks share a blob across checkpoints and objects. A changed mask uses
+a delta against its previous checkpoint when that is smaller (including metadata)
+than a compressed one-bit PNG. New masks and larger edits use PNGs. Chains are
+limited to 16 deltas before another full PNG, keeping reconstruction bounded.
+Only explicit version saves retain history; individual brush strokes do not.
+Repeated unchanged checkpoints add a manifest but no duplicate mask data.
 
-1. Click **Choose image folder** and select a folder on your computer. Supported
-   images in it and its subfolders are read, naturally sorted (`2.jpg` before `10.jpg`),
-   and copied to local project storage in WSL. Selecting the same unchanged folder
-   resumes its saved annotations. Non-image files are ignored. Alternatively, expand
-   **Or open by folder path** and enter a Windows path such as `C:\data\frames`
-   or a WSL path such as `/home/seungbo/frames`; this reads directly without copying.
-2. Left click includes the object; right click excludes background. Buttons also
-   choose include/exclude mode. Add clicks until the overlay looks correct.
-3. Create names under **Project labels** with **Add label**. The list shows all
-   existing labels and their saved-object counts across the sequence. Click a label
-   to select it, or choose it in the **Label name** dropdown. Labels persist even
-   before they are used; older projects recover label names from saved annotations.
-   Then click **Save object** (Enter). Saving commits immediately
-   to disk. New IDs are assigned automatically. Reusing an ID on another frame
-   records the same object manually; it does not perform tracking.
-4. Use Previous/Next or the slider to change frames. Arrow keys navigate; Z undoes
-   a click when focus is outside an input. Each frame is segmented independently.
-5. Saved objects can be refined (replays their points) or deleted. Saving a refinement
-   replaces that object's mask on the current frame. Preview changes require Save.
-6. Download the ZIP export when ready. Reopen the same source folder to resume.
+Back up the **entire project directory**, including `history/`: delta blobs may
+depend on other blobs. Version manifests publish atomically after their data is
+written. An interrupted save can leave unused blobs but cannot publish a partial
+checkpoint. Run `python verify_versions.py` to check persistence and storage.
 
-## Display resizing
+For browser checks, install Playwright in your Node environment, run an isolated
+server with `LABELER_DATA` pointing to a disposable directory, and run
+`node verify_versions_ui.cjs`. It defaults to Chrome and port 8012; override with
+`LABELER_TEST_BROWSER` and `LABELER_TEST_URL`. The test creates a temporary project
+and verifies the dialog, unsaved-edit choices, named versions and downloads.
 
-Use the **Display size** percentage, +/− buttons, or **Fit to view**. Zoomed images
-can be scrolled inside the canvas area. Aspect ratio is preserved. Click coordinates
-are mapped back to the original image regardless of display zoom. The source
-images, SAM 2 inputs, saved PNG mask dimensions, and export dimensions stay unchanged.
-Your display preference is remembered by the browser across frames and sessions.
+## Load CVAT XML annotations
 
-## Label colors and transparency
+1. Open the source image folder.
+2. Under **Load masks**, choose **Load CVAT XML…** and select the extracted
+   `annotations.xml` from a **CVAT for images** export (XML 1.0 / 1.1).
+3. Review the number of masks and matched frames, labels and any skipped shapes.
+   Cancel leaves the project unchanged. Click **Import masks** to apply.
+4. Select **Edit mask** on an imported object, correct its pixels and save.
+   **Save version…** can capture the complete imported or corrected mask set.
 
-Choose a preset from the **New label color** palette, or use its custom color
-picker before adding the label. Colors are selected manually. Existing labels
-start with mint until you choose another color. Click a label's swatch to open
-its color editor, choose a preset or custom color, and click **Save color**.
-All saved objects and previews with that label use the same color.
+CVAT raster masks are decoded from row-major, alternating background/foreground
+RLE runs and placed at their original bounding-box offsets. Polygons are filled
+to binary masks. Components sharing a nonzero group ID and label within an image
+are united; per-image `track_id` attributes preserve object identity across frames.
+Overlapping masks remain independent. Boxes, points, tags and other non-segmentation
+shapes are excluded and counted in the preview.
 
-The **Overlay opacity** slider ranges from 0% (invisible) to 100% (solid).
-Changes preview immediately and save when you release the slider. Label colors
-and project-wide opacity persist with the project and are included in exported
-JSON as `label_colors` and `overlay_opacity`. Exported PNG masks remain binary
-0/255 masks without color or transparency.
+Images match by relative path, then by an unambiguous path suffix or filename.
+XML image IDs and order are not used as frame indices. Dimensions must match the
+EXIF-oriented source images exactly. Missing or ambiguous image matches, invalid
+RLE, malformed polygons and mismatched dimensions reject the entire preview;
+nothing is partially imported. Images with no segmentation shapes are ignored.
 
-## Files and export
+Imports **add** objects with new local IDs, keeping existing masks and checkpoints.
+Existing labels are matched case-insensitively and retain their colors; new labels
+use CVAT colors when supplied. Importing the same XML twice adds duplicate objects.
+An import preview expires when another import starts, the project is reopened,
+or its saved contents change. XML files are limited to 64 MiB. Flipped tasks and
+video-track XML are rejected; export those annotations as **CVAT for images**
+aligned with the source images. ZIP archives are not accepted directly.
 
-Projects are stored in `projects/<folder-hash>/annotations.json` with their masks
-under `masks/`. Each saved object PNG has source-image resolution, with pixels
-0 for background and 255 for foreground. EXIF orientation is applied consistently
-to images and masks. Independent masks may overlap. JSON maps zero-based frame
-indices to source filenames, object IDs, class names, prompts, dimensions, and
-model scores. Scores describe the model's estimate, not annotation correctness.
-Exports include JSON and masks, excluding the original source images.
+CVAT parsing is isolated in `cvat_import.py`, which produces validated staged masks.
+Other import formats can later supply the same staged objects. Run
+`python verify_cvat.py` for decoding, atomicity, persistence and version checks,
+or `node verify_cvat_ui.cjs` against a disposable server for the browser workflow.
+Browser-test settings match `verify_versions_ui.cjs` above.
 
-Keep source files in place and unchanged to resume. Adding/removing/modifying
-frames in an existing labeled folder is rejected to prevent frame-index mistakes.
-Copy a changed sequence to a new folder to create a separate project. Back up the
-project directory along with its original frames.
+Format reference: [CVAT XML specification](https://docs.cvat.ai/docs/dataset_management/formats/format-cvat/).
 
-## Optional settings
+## SAM2-assisted annotation
 
-```bash
-export SAM2_CHECKPOINT=/path/to/checkpoint.pt
+Run the server in a Python environment with SAM2 and PyTorch installed. See
+[Meta's SAM2 installation guide](https://github.com/facebookresearch/sam2#installation).
+The model loads only on the first prediction. A tiny SAM 2.1 checkpoint is
+automatically searched for in `../sam2/checkpoints/` and the installed SAM2 source
+checkout's `checkpoints/` directory. Override it and the matching config as needed:
+
+```sh
+export SAM2_CHECKPOINT=/path/to/sam2.1_hiera_tiny.pt
 export SAM2_CONFIG=configs/sam2.1/sam2.1_hiera_t.yaml
-export SAM2_DEVICE=cuda  # or cpu
-export LABELER_DATA=/path/to/project-storage
-export PORT=8000
+export SAM2_DEVICE=cuda  # optional; automatically chooses CUDA or CPU
+export LABELER_PYTHON=/path/to/sam-environment/bin/python
 bash run.sh
 ```
 
-The checkpoint and config must match. Set `LABELER_PYTHON` if your environment
-uses a different Python interpreter. The backend binds to localhost and accesses
-local frame folders; it is intended for personal use on this computer.
+On the existing WSL setup, the Python interpreter is
+`/home/seungbo/anaconda3/envs/sam/bin/python`. Manual tools stay usable if SAM2 is
+unavailable; the SAM2 panel reports missing dependencies or a missing checkpoint.
 
-## Brush corrections
+1. New projects automatically include teeth_gum, soft_tissue, glove,
+   unusable_region and background, listed above the custom-label form. Use
+   **Add default labels** to add missing defaults to an existing project.
+   Existing labels/colors are preserved. Background
+   is an explicit annotation label; unannotated pixels are not filled automatically.
+2. Select a label, then choose **SAM2 points**. Left click includes a region;
+   right click excludes it. Include/Exclude buttons also choose point type.
+3. By default the predicted region is added to the current mask. Use **New SAM
+   region** to keep the current pixels and start prompts for another disconnected
+   region in the same mask. Other application modes remove the predicted region
+   from the mask or replace the mask. Negative points refine the predicted region;
+   they do not directly erase previously accepted regions.
+4. **Undo point** removes the last prompt; removing all points restores the mask
+   from before that region. **Generate / retry** retries after a prediction error.
+   Saving is blocked while prompts have no valid prediction. Switching to the
+   brush editor accepts the last successful result and clears pending prompts.
+5. Switch to **Brush editor** for pixel corrections. **Undo edit** undoes brush
+   strokes or whole prediction updates. **Save object** commits the final pixels,
+   and **Save version…** checkpoints the complete saved mask set.
 
-After a SAM prediction, choose **Brush** (B) to paint or **Eraser** (E) to remove
-mask regions. Size is the circular brush diameter in original-image pixels. Right-drag temporarily erases in either brush mode. [ and ]
-change size. **Undo stroke** / **Redo stroke** (Ctrl+Z / Ctrl+Shift+Z) act on whole
-strokes; history is limited to 30 strokes and approximately 64 MiB of snapshots.
-Use **Pan** or hold Space and drag to move around a zoomed image.
+**Edit mask** always opens saved pixels, including brush corrections and imported
+CVAT masks. SAM2 results remain unsaved until Save object. Prompt provenance is
+stored for the last predicted region, but the actual saved PNG is authoritative.
+The displayed SAM score applies only to that predicted region, not to the combined
+or manually corrected mask. Image embeddings are reused on the same frame. This
+is single-frame prompting; video propagation is not enabled. The five annotation
+labels remain independent; binary SegFormer training mapping is not configured.
 
-Click **Edit mask** on a saved object to open its actual saved pixels, including
-previous brush corrections. **Save mask** commits the corrected PNG. Unsaved
-corrections trigger a discard prompt on navigation. You may also select Brush
-on a new object and draw a mask without SAM. Empty masks cannot be saved; delete
-the saved object instead. **SAM points** (P) returns to point prompting; running
-SAM again replaces brush corrections after confirmation. **Refine SAM** explicitly
-regenerates a saved mask from its stored prompts. Objects with no positive prompts
-can be corrected with Edit mask or prompted afresh.
-
-Corrections are stored at original resolution as binary PNG masks. JSON records
-`manually_edited: true` and `score: null` for manually saved masks because the old
-model score does not measure the corrected result. Editing does not train SAM 2.
-The editor uses the core CVAT paint/erase workflow; polygon-to-mask and automatic
-removal of overlapping pixels from other objects are not implemented.
-
-Use **Hide masks (H)**, the **Show masks** checkbox, or the H key to toggle
-all saved/draft mask overlays and prompt points. Visibility works after brush
-strokes and while editing; hiding does not change pixels or discard corrections.
+Run `python verify_sam.py` in the SAM2 environment for real-model verification.
+Run `node verify_sam_ui.cjs` against a disposable SAM2-enabled server for the
+browser test, with the same Playwright setup and test URL settings described above.

@@ -32,4 +32,15 @@ canvas{display:block;flex:none;max-width:none;max-height:none;object-fit:fill}
 .opacitybar{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);padding-bottom:12px}
 .opacitybar label{margin:0}.opacitybar input{width:150px;accent-color:var(--accent)}.opacitybar output{width:36px}
 
-.brushbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding-bottom:7px}.brushbar button{font-size:12px;padding:6px 9px}.brushbar label{margin:0;font-size:11px}.brushbar input#brush-size{width:65px;padding:6px;font-size:12px}.brushbar select{width:85px;padding:6px;font-size:12px}.brush-help{color:var(--muted);font-size:11px;margin:0 0 10px}#brush-cursor{position:fixed;pointer-events:none;z-index:1000;border:1px solid white;box-shadow:0 0 0 1px #10151c;transform:translate(-50%,-50%)}#brush-cursor.eraser{border-color:#ff718a}.object .row{flex-wrap:wrap}#viewport{min-height:120px}
+canvas{touch-action:none;cursor:crosshair}
+#version-count{float:right;color:var(--accent)}
+.version-card{border:1px solid var(--line);border-radius:7px;padding:10px;margin-top:10px;overflow-wrap:anywhere}
+.version-card strong{font-size:13px}.version-card button{font-size:12px;padding:5px 12px}
+.version-note{white-space:pre-wrap}
+dialog{width:min(460px,calc(100vw - 32px));max-height:85vh;overflow:auto;background:var(--panel);color:#e7edf5;border:1px solid var(--line);border-radius:12px;padding:24px}
+dialog::backdrop{background:#0009}
+dialog h2{font-size:15px;text-transform:none;letter-spacing:0}
+dialog textarea{width:100%;background:var(--bg);color:inherit;border:1px solid var(--line);border-radius:7px;padding:10px;font:inherit;resize:vertical}
+.version-actions{display:flex;flex-direction:column;gap:8px}
+#version-error{color:#ff9c9c;font-size:12px}#version-cancel{margin-top:12px}
+#cvat-error{color:#ff9c9c;font-size:12px}
