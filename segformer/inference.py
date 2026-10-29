@@ -216,7 +216,7 @@ def run(args: argparse.Namespace) -> dict:
     seen = set()
     for image in images:
         relative = image.relative_to(root).with_suffix(".png")
-        paths = [output / "predictions" / name / relative for name in settings["labels"]] if len(settings["labels"]) > 1 else [output / "predictions" / relative]
+        paths = [output / name / relative for name in settings["labels"]] if len(settings["labels"]) > 1 else [output / relative]
         for path in paths:
             if path in seen:
                 raise ValueError(f"Different input images map to the same output: {path}")
@@ -231,8 +231,6 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("Output path collision with predictions.json")
     if manifest_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output manifest already exists: {manifest_path}. Use a new output directory or --overwrite.")
-    for folder in ("predictions", "overlays", "videos"):
-        (output / folder).mkdir(parents=True, exist_ok=True)
     records = []
     print(f"Device: {device}; images: {len(images)}; labels: {settings['labels']}; threshold: {settings['threshold']}")
     with torch.inference_mode(), tqdm(total=len(images), desc="Inference", unit="image", dynamic_ncols=True) as progress:
