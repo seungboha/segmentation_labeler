@@ -36,9 +36,9 @@ with tempfile.TemporaryDirectory(prefix="labeler-check-") as tmp:
         p = checked(client.post("/api/open", json={"folder": str(frames)}))
         assert [f["name"] for f in p["frames"]] == ["frame2.png", "frame10.png"]
         pid = p["id"]
-        defaults = list(backend.DEFAULT_LABEL_COLORS)
+        defaults = ["teeth_gum"]
         assert p["labels"] == defaults
-        assert p["label_colors"] == backend.DEFAULT_LABEL_COLORS
+        assert p["label_colors"] == {"teeth_gum": "#68ddbc"}
         p = checked(client.post("/api/labels", json={"project": pid, "name": "circle", "color": "#82B6FF"}))
         assert p["label_colors"]["circle"] == "#82b6ff"
         checked(client.post("/api/labels", json={"project": pid, "name": "unused label"}))

@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id);
 let project = null, frame = 0, image = null, savedMasks = [], history = [], draft = null, draftImage = null, draftMask = null;
 let colorLabel = null, stroke = null;
 let pendingCvat = null;
+let trainingInfo=null, trainingPoll=null, trainingLogJob=null;
 let tool = 'brush', samPoints = [], samBase = null, samBaseDirty = false, samBasePoints = [], samPending = false, samUsedPoints = [];
 let busy = false, dirty = false, positive = true, editing = null;
 let displayMode = 'fit', displayZoom = 1;
@@ -28,11 +29,15 @@ function controls() {
   $('next').disabled = busy || !project || frame === project.frames.length-1;
   $('save-version').disabled = busy || !project || !!stroke;
   for(const id of ['version-name','version-note'])$(id).disabled=busy;
+  $('mark-ready').disabled=busy||!image||dirty||!!stroke;
+  $('mark-draft').disabled=busy||!project?.training_approvals?.[String(frame)];
+  $('training-start').disabled=busy||!!trainingInfo?.jobs?.some(job=>job.status==='running');
+  renderReady();
 }
 async function task(fn) {
   if (busy) return;
   busy=true; controls();
-  try { await fn(); } catch(e) { status(e.message, true);if($('version-dialog').open)$('version-error').textContent=e.message;if($('cvat-dialog').open)$('cvat-error').textContent=e.message; }
+  try { await fn(); } catch(e) { status(e.message, true);if($('version-dialog').open)$('version-error').textContent=e.message;if($('cvat-dialog').open)$('cvat-error').textContent=e.message;if($('training-dialog').open)$('training-error').textContent=e.message; }
   finally { busy=false; controls(); }
 }
 async function api(path, body, method) {
@@ -126,6 +131,9 @@ function updateProject() {
   $('opacity').value=Math.round((project.overlay_opacity??.45)*100);$('opacity-value').textContent=`${$('opacity').value}%`;
   $('savepath').textContent=`Saved to ${project.save_directory}`;
   renderVersions();
+  const ready=project.training_approvals?.[String(frame)];
+  $('subject-id').value=ready?.subject??(project.frames[frame].name.split('/').pop().match(/^(\d+)_/)?.[1]||'');
+  renderReady();
 }
 function renderVersions(){
   const versions=project.mask_versions||[];
@@ -385,7 +393,83 @@ $('class').onchange=()=>{if(draft)dirty=true;updateLabels();controls();};$('obje
 $('export').onclick=()=>{if(dirty&&!confirm('Export saved masks only? The current preview has not been saved.'))return;window.location.href=`/api/export?project=${project.id}`;};
 window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
 window.addEventListener('resize',applyDisplay);
-window.addEventListener('keydown',e=>{if(busy||$('version-dialog').open||$('cvat-dialog').open||['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;const ids={ArrowLeft:'prev',ArrowRight:'next',z:'undo',Z:'undo',Enter:'save'};if(ids[e.key]){e.preventDefault();$(ids[e.key]).click();}});
+window.addEventListener('keydown',e=>{if(busy||document.querySelector('dialog[open]')||['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;const ids={ArrowLeft:'prev',ArrowRight:'next',z:'undo',Z:'undo',Enter:'save'};if(ids[e.key]){e.preventDefault();$(ids[e.key]).click();}});
+function renderReady(){
+  if(!project){$('ready-status').textContent='Open an image first.';return;}
+  const ready=project.training_approvals?.[String(frame)];
+  const state=dirty?'Unsaved edits':ready?'Ready':(project.annotations[String(frame)]||[]).length?'Draft':'Unlabeled';
+  $('ready-status').textContent=`${state} · ${Object.keys(project.training_approvals||{}).length} Ready images`;
+}
+$('mark-ready').onclick=()=>task(async()=>{
+  if(dirty)throw new Error('Save your object edits before approving this image.');
+  const empty=!(project.annotations[String(frame)]||[]).some(a=>a.class_name.toLowerCase()==='teeth_gum');
+  if(!confirm(empty?'Confirm this whole image contains no usable teeth/gum. It will train as background only.':'Confirm all usable teeth/gum regions in this image have been labeled.'))return;
+  const value=$('subject-id').value;
+  project=await api('/api/training/ready',{project:project.id,frame,allow_empty:empty,subject_id:value===''?null:Number(value)});
+  updateProject();status('Image marked Ready for training.');
+});
+$('mark-draft').onclick=()=>task(async()=>{
+  project=await api('/api/training/ready',{project:project.id,frame,ready:false});
+  updateProject();status('Image returned to Draft. Existing training snapshots are preserved.');
+});
+function selectedValidationSubjects(){return [...$('validation-subjects').querySelectorAll('input:checked')].map(el=>Number(el.value));}
+function renderTrainingSplit(){
+  const selected=new Set(selectedValidationSubjects());
+  const val=(trainingInfo?.subjects||[]).filter(s=>selected.has(s.id)).reduce((n,s)=>n+s.count,0);
+  $('training-split').textContent=`${(trainingInfo?.ready_count||0)-val} training images · ${val} validation images. Select at least one subject for each split.`;
+}
+async function refreshTraining(initial=false){
+  const pid=project.id;
+  const info=await api(`/api/training?project=${pid}`);
+  if(project.id!==pid)return;
+  trainingInfo=info;
+  $('training-count').textContent=`${info.ready_count} Ready images across ${info.subjects.length} subjects`;
+  if(initial){
+    $('training-error').textContent='';
+    for(const [id,key] of [['train-checkpoint','checkpoint'],['train-python','python'],['train-config','config'],['train-epochs','epochs'],['train-lr','learning_rate']])$(id).value=info.defaults[key];
+    const previous=new Set(info.jobs[0]?.val_subjects||[]);
+    $('validation-subjects').replaceChildren(...info.subjects.map(s=>{
+      const label=document.createElement('label');label.className='subject-choice';
+      const box=document.createElement('input');box.type='checkbox';box.value=s.id;box.checked=previous.has(s.id);box.onchange=renderTrainingSplit;
+      label.append(box,document.createTextNode(`Subject ${s.id} · ${s.count} images`));return label;
+    }));
+    renderTrainingSplit();
+  }
+  $('training-jobs').replaceChildren(...info.jobs.map(job=>{
+    const card=document.createElement('div');card.className='version-card';
+    const title=document.createElement('strong');title.textContent=`${job.id.slice(0,8)} · ${job.status}${info.active_model?.job_id===job.id?' · selected':''}`;
+    const detail=document.createElement('p');detail.className='hint';detail.textContent=`${job.train_images} train / ${job.val_images} validation · ${job.epochs} epochs · ${new Date(job.created_at).toLocaleString()}`;
+    const metric=document.createElement('p');metric.className='hint';metric.textContent=`Validation ${job.validation_id.slice(0,12)}${job.best_dice==null?'':` · Best Dice ${job.best_dice.toFixed(4)}`}`;
+    const log=document.createElement('button');log.textContent='Show log';log.onclick=()=>task(async()=>{trainingLogJob=job.id;$('training-log').textContent=(await api(`/api/training/${job.id}/log?project=${pid}`)).text;});
+    card.append(title,detail,metric,log);
+    if(job.error){const error=document.createElement('p');error.textContent=job.error;card.append(error);}
+    if(job.status==='completed'){
+      const use=document.createElement('button');use.textContent='Use this model';use.onclick=()=>task(async()=>{
+        project=await api('/api/training/activate',{project:pid,job_id:job.id});
+        $('train-checkpoint').value=job.checkpoint;await refreshTraining();status('Model selected as the starting checkpoint for future training.');
+      });card.append(use);
+    }
+    return card;
+  }));
+  const running=info.jobs.find(j=>j.status==='running');
+  const logId=trainingLogJob||running?.id;
+  if(logId)$('training-log').textContent=(await api(`/api/training/${logId}/log?project=${pid}`)).text;
+}
+$('train-model').onclick=()=>task(async()=>{
+  if(dirty)throw new Error('Save or discard your current object edits before opening training.');
+  trainingLogJob=null;$('training-log').textContent='';
+  await refreshTraining(true);$('training-dialog').showModal();
+  clearInterval(trainingPoll);trainingPoll=setInterval(()=>{if(!busy&&$('training-dialog').open)task(()=>refreshTraining());},4000);
+});
+$('training-form').onsubmit=e=>{e.preventDefault();task(async()=>{
+  $('training-error').textContent='';
+  const selected=selectedValidationSubjects();
+  if(!selected.length||selected.length===trainingInfo.subjects.length)throw new Error('Choose validation subjects and leave at least one subject for training.');
+  const job=await api('/api/training/start',{project:project.id,python:$('train-python').value,config:$('train-config').value,checkpoint:$('train-checkpoint').value,epochs:Number($('train-epochs').value),learning_rate:Number($('train-lr').value),validation_subjects:selected});
+  trainingLogJob=job.id;await refreshTraining();status('Training started from a fixed snapshot. You can close this dialog and continue labeling.');
+});};
+$('training-close').onclick=()=>$('training-dialog').close();
+$('training-dialog').addEventListener('close',()=>clearInterval(trainingPoll));
 $('folder').value=localStorage.getItem('labeler-folder')||'';
 renderPalette('new-palette','newcolor');renderPalette('edit-palette','editcolor');
 controls();api('/api/status').then(s=>{$('device').textContent=s.device;$('sam-status').textContent=s.sam2?.message||'SAM2 status unavailable.';}).catch(e=>status(e.message,true));

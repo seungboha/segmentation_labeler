@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, Field
 import mask_history
 import cvat_import
+import training_workflow as training
 from sam_assist import SamAssist, SamUnavailable
 
 ROOT = Path(__file__).resolve().parent
@@ -208,7 +209,7 @@ def open_project(req: OpenRequest):
             (dest / "masks").mkdir(exist_ok=True)
             p = {"version": 1, "id": pid, "source_folder": str(folder), "frames": frames,
                  "annotations": {}, "next_object_id": 1,
-                 "labels": list(DEFAULT_LABEL_COLORS), "label_colors": dict(DEFAULT_LABEL_COLORS)}
+                 "labels": ["teeth_gum"], "label_colors": {"teeth_gum": DEFAULT_LABEL_COLORS["teeth_gum"]}}
             atomic_json(manifest, p)
         # Older projects stored class names only on saved annotations.
         labels = list(dict.fromkeys(p.get("labels", []) + [a["class_name"] for entries in p["annotations"].values() for a in entries]))
@@ -447,6 +448,7 @@ def apply_cvat(req: ApplyImportRequest):
                               "source": "cvat", "cvat": {"file": pending["filename"], "sha256": pending["sha256"],
                                 "image": item["image_name"], "group_id": item["group"], "track_id": item["track"]}}
                 updated["annotations"].setdefault(str(item["frame"]), []).append(annotation)
+            training.invalidate(updated, [item['frame'] for item in pending['items']])
             atomic_json(project_dir(p) / "annotations.json", updated)
         except Exception:
             for path in written:
@@ -506,6 +508,7 @@ def save_mask(req: SaveRequest):
             annotation["sam_points"] = [point.model_dump() for point in req.sam_points]
         updated = {**p, "annotations": {**p["annotations"], key: [a for a in existing if a["object_id"] != oid] + [annotation]},
                    "next_object_id": max(p["next_object_id"], oid + 1)}
+        training.invalidate(updated, [req.frame])
         atomic_json(project_dir(p) / "annotations.json", updated)
         p.update(updated)
         if previous:
@@ -532,6 +535,7 @@ def delete_mask(index: int, oid: int, project: str):
         if annotation is None:
             raise HTTPException(404, "Mask not found.")
         updated = {**p, "annotations": {**p["annotations"], str(index): [a for a in entries if a["object_id"] != oid]}}
+        training.invalidate(updated, [index])
         atomic_json(project_dir(p) / "annotations.json", updated)
         p.update(updated)
         (project_dir(p) / annotation["mask_file"]).unlink(missing_ok=True)
@@ -573,3 +577,95 @@ def export_version(version_id: str, project: str):
             raise HTTPException(404, "Version not found.")
         return Response(data, media_type="application/zip", headers={
             "Content-Disposition": f'attachment; filename="mask-version-{version_id[:8]}.zip"'})
+
+
+class ReadyRequest(BaseModel):
+    project: str
+    frame: int = Field(ge=0)
+    ready: bool = True
+    allow_empty: bool = False
+    subject_id: int | None = Field(default=None, ge=0)
+
+
+class TrainRequest(BaseModel):
+    project: str
+    python: str
+    config: str
+    checkpoint: str
+    validation_subjects: list[int] = Field(min_length=1)
+    epochs: int = Field(ge=1, le=10000)
+    learning_rate: float = Field(gt=0, le=0.1, allow_inf_nan=False)
+
+
+class ActivateModelRequest(BaseModel):
+    project: str
+    job_id: str = Field(pattern=r'^[0-9a-f]{32}$')
+
+
+@app.post('/api/training/ready')
+def mark_ready(req: ReadyRequest):
+    with LOCK:
+        p, f = frame_info(req.project, req.frame)
+        updated = {**p}
+        try:
+            if req.ready:
+                training.approve(project_dir(p), updated, req.frame, read_frame(p, f), req.allow_empty, req.subject_id)
+            else:
+                training.invalidate(updated, [req.frame])
+        except (ValueError, OSError) as error:
+            raise HTTPException(400, str(error))
+        atomic_json(project_dir(p) / 'annotations.json', updated)
+        p.update(updated)
+        return public_project(p)
+
+
+@app.get('/api/training')
+def training_status(project: str):
+    with LOCK:
+        p = require_project(project)
+        records = list(p.get('training_approvals', {}).values())
+        defaults = training.defaults()
+        if p.get('active_model'):
+            defaults['checkpoint'] = p['active_model']['checkpoint']
+        return {'defaults': defaults, 'ready_count': len(records),
+                'subjects': [{'id': sid, 'count': sum(r['subject'] == sid for r in records)}
+                             for sid in sorted({r['subject'] for r in records})],
+                'jobs': training.jobs(project), 'active_model': p.get('active_model')}
+
+
+@app.post('/api/training/start')
+def start_training(req: TrainRequest):
+    with LOCK:
+        p = require_project(req.project)
+        try:
+            return training.start(project_dir(p), p, req.model_dump())
+        except (ValueError, OSError, KeyError, ImportError) as error:
+            raise HTTPException(400, str(error))
+
+
+@app.get('/api/training/{job_id}/log')
+def training_log(job_id: str, project: str):
+    with LOCK:
+        require_project(project)
+        job = next((j for j in training.jobs(project) if j['id'] == job_id), None)
+        if job is None:
+            raise HTTPException(404, 'Training job not found.')
+        path = training.LOGS / job_id / 'console.log'
+        if not path.exists():
+            return {'text': ''}
+        with path.open('rb') as file:
+            file.seek(max(0, path.stat().st_size - 16000))
+            return {'text': file.read().decode('utf-8', errors='replace')}
+
+
+@app.post('/api/training/activate')
+def activate_model(req: ActivateModelRequest):
+    with LOCK:
+        p = require_project(req.project)
+        job = next((j for j in training.jobs(req.project) if j['id'] == req.job_id), None)
+        if not job or job['status'] != 'completed' or not (Path(job['checkpoint']) / 'config.json').is_file():
+            raise HTTPException(400, 'Only a successfully trained model can be selected.')
+        updated = {**p, 'active_model': {'job_id': job['id'], 'checkpoint': job['checkpoint']}}
+        atomic_json(project_dir(p) / 'annotations.json', updated)
+        p.update(updated)
+        return public_project(p)

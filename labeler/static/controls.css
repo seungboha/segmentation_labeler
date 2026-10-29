@@ -44,3 +44,8 @@ dialog textarea{width:100%;background:var(--bg);color:inherit;border:1px solid v
 .version-actions{display:flex;flex-direction:column;gap:8px}
 #version-error{color:#ff9c9c;font-size:12px}#version-cancel{margin-top:12px}
 #cvat-error{color:#ff9c9c;font-size:12px}
+#training-dialog{width:min(680px,calc(100vw - 32px))}
+#training-error{color:#ff9c9c}
+#training-log{max-height:240px;overflow:auto;white-space:pre-wrap;font-size:11px;background:#111820;padding:10px}
+.subject-choice{display:flex;align-items:center;gap:8px}.subject-choice input{width:auto}
+#validation-subjects{max-height:160px;overflow:auto}#ready-status{color:var(--accent)}

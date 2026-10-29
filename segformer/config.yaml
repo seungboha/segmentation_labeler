@@ -1,0 +1,78 @@
+# Data layout matches /home/seungbo/RemovalAI/HierarchicalUnet.
+DATASET_PATH: /home/seungbo/RemovalAI/HierarchicalDataset/train
+# All frames belonging to these subject IDs are used for training. Validation
+# uses every remaining non-excluded subject found under DATASET_PATH/RGB.
+TRAIN_SUBJECTS: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
+MASKS:
+  WIDE_DIR: Label/wide
+  NARROW_DIR: Label/narrow
+LABEL_TYPE: wide # narrow, wide, or hierarchical
+EXCLUDE_SUBJECTS: []
+
+# nvidia/mit-b0 supplies the ImageNet-pretrained MiT-B0 encoder. The SegFormer
+# decoder is initialized for the number of target masks below.
+MODEL_NAME: nvidia/mit-b0
+INPUT_SIZE: 256
+NORMALIZATION:
+  MEAN: [0.485, 0.456, 0.406]
+  STD: [0.229, 0.224, 0.225]
+
+# {label_type} is expanded after LABEL_TYPE and CLI overrides are read.
+OUTPUT_DIR: ./logs/segformer_b0_{label_type}
+RESUME_FROM: null # e.g. ./outputs/segformer_b0_narrow/last
+DEVICE: auto # auto, cpu, cuda, or cuda:0
+AMP: true
+PIN_MEMORY: true
+
+BATCH_SIZE: 8
+EPOCHS: 100
+NUM_WORKERS: 4
+SEED: 42
+
+LEARNING_RATE: 0.00006
+MIN_LEARNING_RATE: 0.000001
+WEIGHT_DECAY: 0.01
+WARMUP_EPOCHS: 5
+GRADIENT_CLIP_NORM: 1.0 # 0 disables clipping
+EARLY_STOPPING_PATIENCE: 20 # 0 disables early stopping
+THRESHOLD: 0.5
+LOG_EVERY_STEPS: 50
+
+LOSS:
+  BCE_WEIGHT: 0.7
+  DICE_WEIGHT: 0.3
+  POS_WEIGHT: 1.0 # scalar or one value per output channel
+  CHANNEL_WEIGHTS: 1.0 # scalar or [wide_weight, narrow_weight]
+  HIERARCHY_WEIGHT: 0.1 # used only for LABEL_TYPE=hierarchical
+  EPSILON: 0.000001
+
+AUGMENTATION:
+  ENABLE: true
+  TYPE: elastic_color # light, heavy, or elastic_color
+  HORIZONTAL_FLIP_P: 0.5
+  VERTICAL_FLIP_P: 0.5
+  ROTATE_LIMIT: 10
+  AFFINE_P: 0.4
+  SHIFT_LIMIT: 0.04
+  SCALE_LIMIT: 0.08
+  ELASTIC_P: 0.99
+  ELASTIC_ALPHA: 30.0
+  ELASTIC_SIGMA: 12.0
+  ELASTIC_APPROXIMATE: true
+  BRIGHTNESS_LIMIT: 0.16
+  CONTRAST_LIMIT: 0.18
+  BRIGHTNESS_CONTRAST_P: 0.6
+  GAMMA_LIMIT: [92, 115]
+  GAMMA_P: 0.4
+  HUE_SHIFT_LIMIT: 5
+  SAT_SHIFT_LIMIT: 12
+  VAL_SHIFT_LIMIT: 15
+  HSV_P: 0.15
+  BLUR_P: 0.07
+  BLUR_LIMIT: 3
+  GAUSSIAN_BLUR_SIGMA_LIMIT: [0.1, 0.6]
+  NOISE_P: 0.2
+  NOISE_MEAN_RANGE: [0.0, 0.0]
+  NOISE_STD_RANGE: [0.02, 0.08]
+  NOISE_PER_CHANNEL: true
+  NOISE_SCALE_FACTOR: 1.0

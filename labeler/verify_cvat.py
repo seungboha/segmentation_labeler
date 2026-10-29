@@ -110,8 +110,8 @@ with tempfile.TemporaryDirectory(prefix="cvat-check-") as temporary:
         imported = checked(apply(result))["project"]
         assert len(imported["annotations"]["0"]) == 3
         assert len(imported["annotations"]["1"]) == 1
-        assert imported["labels"] == list(backend.DEFAULT_LABEL_COLORS) + ["tool", "tissue"]
-        assert imported["label_colors"] == {**backend.DEFAULT_LABEL_COLORS, "tool": "#abcdef", "tissue": "#123456"}
+        assert imported["labels"] == ["teeth_gum", "tool", "tissue"]
+        assert imported["label_colors"] == {"teeth_gum": "#68ddbc", "tool": "#abcdef", "tissue": "#123456"}
         a = next(a for a in imported["annotations"]["0"] if a.get("source") == "cvat" and a["class_name"] == "tool")
         b = imported["annotations"]["1"][0]
         assert a["object_id"] == b["object_id"]  # CVAT track_id=0 survives across images.
